@@ -38,8 +38,13 @@ this may cause unexpected behavior.
 .B \-\-queue\ [queue1:queue2:...:queueN]\ [list\ of\ nodes]
 Set queue associations.  The list of queues to set on a node is ':'-delimited.
 .TP
-.B \-l \-\-list'
-list node states
+.B \-l \-\-list
+List node states
+.TP
+.B \-\-xml
+.B [Cray Only]
+Extract node information and print to stdout as XML.
+
 .SH "NOTES"
 .SS "Cray Systems"
 On Cray systems nodes are referenced by their integer node id.  Nodes may be

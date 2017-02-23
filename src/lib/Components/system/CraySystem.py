@@ -8,6 +8,9 @@ import sys
 import xmlrpclib
 import json
 import ConfigParser
+import xml.etree.ElementTree
+from xml.etree.ElementTree import Element
+import xml.dom.minidom
 import Cobalt.Util
 import Cobalt.Components.system.AlpsBridge as ALPSBridge
 from Cobalt.Components.base import Component, exposed, automatic, query, locking
@@ -282,6 +285,31 @@ class CraySystem(BaseSystem):
         if as_json:
             return json.dumps(node_info)
         return node_info
+
+    @exposed
+    def fetch_system_data(self):
+        '''Fetch a system data summary for use in time-stepping simulation.
+        This provides a summary of system options in-use as well as a hardware
+        inventory and queue associations.
+
+        Returns:
+            A string containing the current runnning system configuration
+
+        Notes:
+            External facing XMLRPC function
+
+        '''
+        system = Element('CraySystem')
+        system.set('drain_mode', DRAIN_MODE)
+        system.set('backfill_epsilon', str(BACKFILL_EPSILON))
+        system.set('cleanup_drain_window', str(CLEANUP_DRAIN_WINDOW))
+        system.set('size', str(self.system_size))
+
+        with self._node_lock:
+            for node in self.nodes.values():
+                system.append(node.to_xml())
+
+        return xml.dom.minidom.parseString(xml.etree.ElementTree.tostring(system)).toprettyxml(indent='    ')
 
     def _run_update_state(self):
         '''automated node update functions on the update timer go here.'''

@@ -1,6 +1,7 @@
 """Cray-specific node information"""
 
 import logging
+from xml.etree.ElementTree import Element, SubElement
 from Cobalt.Components.system.ClusterNode import ClusterNode
 
 _logger = logging.getLogger(__name__)
@@ -58,6 +59,20 @@ class CrayNode(ClusterNode):
             params = [p.lower() for p in params]
             ret_node = {k:v for k, v in ret_node.items() if k.lower() in params}
         return ret_node
+
+    def to_xml(self):
+        '''Generate an xml.etree object representation of a Cray Compute Node'''
+        node = Element('Node')
+        node.set('node_id', str(self.node_id))
+        node.set('name', str(self.name))
+        for key, val in self.attributes.items():
+            node.set(key, str(val))
+
+        for queue in self.queues:
+            xml_queue = SubElement(node, 'Queue')
+            xml_queue.set('name', queue)
+
+        return node
 
     def __str__(self):
         return str(self.to_dict())

@@ -13,6 +13,7 @@ OPTIONS DEFINITIONS:
 '--queue',action='store', dest='queue', help='set queue associations'
 '-l','--list_nstates',action='store_true', dest='list_nstates', help='list the node states'
 '-b','--list_details',action='store_true', dest='list_details', help='list detalied information for specified nodes'
+'--xml',action='store_true',dest='to_xml',help='write node information to stdout as xml'
 
 """
 import logging
@@ -38,7 +39,8 @@ def validate_args(parser):
 
     opt_count = client_utils.get_options(spec,opts,opt2spec,parser)
 
-    if (parser.no_args() and not parser.options.list_nstates) or opt_count == 0:
+    if ((parser.no_args() and not parser.options.list_nstates and not
+            parser.options.to_xml) or opt_count == 0):
         client_utils.print_usage(parser)
         sys.exit(1)
 
@@ -51,7 +53,7 @@ def validate_args(parser):
 
     # Check mutually exclusive options
     mutually_exclusive_option_lists = [['down', 'up', 'list_nstates',
-        'list_details', 'queue']]
+        'list_details', 'queue', 'xml']]
 
     if opt_count > 1:
         client_utils.validate_conflicting_options(parser, mutually_exclusive_option_lists)
@@ -87,8 +89,12 @@ def main():
 
     impl = client_utils.component_call(SYSMGR, False, 'get_implementation', ())
 
+
     if impl in ['alps_system']:
         updates = {}
+        if opt.to_xml:
+            client_utils.logger.info(client_utils.component_call(SYSMGR, False, 'fetch_system_data', ()))
+            return
         if opt.list_nstates:
             client_utils.print_node_list()
             return
