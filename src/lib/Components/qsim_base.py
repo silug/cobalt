@@ -95,14 +95,14 @@ def parseline_alt(line):
             return "0" + _input
         else:
             return _input
-    
+
     temp= {}
     splits = line.split(';')
-        
+
     for item in splits:
         tup = item.partition('=')
         temp[tup[0]] = tup[2]
-    
+
     fmtdate = temp['qtime']
     submittime_sec = date_to_sec(fmtdate, "%Y-%m-%d %H:%M:%S")
     submittime_date = sec_to_date(submittime_sec)
@@ -125,8 +125,8 @@ def parseline_alt(line):
     return temp
 
 def parse_work_load(filename):
-    '''parse the whole work load file, return a raw job dictionary''' 
-    temp = {'jobid':'*', 'submittime':'*', 'queue':'*', 
+    '''parse the whole work load file, return a raw job dictionary'''
+    temp = {'jobid':'*', 'submittime':'*', 'queue':'*',
             'Resource_List.walltime':'*','nodes':'*', 'runtime':'*'}
     # raw_job_dict = { '<jobid>':temp, '<jobid2>':temp2, ...}
     raw_job_dict = {}
@@ -150,10 +150,10 @@ def parse_work_load(filename):
 
 def subtimecmp(spec1, spec2):
     return cmp(spec1.get('submittime'), spec2.get('submittime'))
-        
+
 def tune_workload(specs, frac=1, anchor=0):
     '''tune workload heavier or lighter, and adjust the start time to anchor, specs should be sorted by submission time'''
-  
+
     #calc intervals (the first job's interval=0, the i_th interval is sub_i - sub_{i-1}
     lastsubtime = 0
     for spec in specs:
@@ -163,27 +163,27 @@ def tune_workload(specs, frac=1, anchor=0):
             interval = spec['submittime'] - lastsubtime
         lastsubtime =  spec['submittime']
         spec['interval'] = interval
-    
+
     #if anchor is specified, set the first job submission time to anchor
     if anchor:
         specs[0]['submittime'] = anchor
     else:
         pass
-        
-    last_newsubtime = specs[0].get('submittime')    
+
+    last_newsubtime = specs[0].get('submittime')
     for spec in specs:
         interval = spec['interval']
         newsubtime = last_newsubtime + frac * interval
         spec['submittime'] = newsubtime
         spec['interval'] = frac * interval
         last_newsubtime = newsubtime
-        
-    
+
+
 def sec_to_date(sec, dateformat="%m/%d/%Y %H:%M:%S"):
     tmp = datetime.fromtimestamp(sec)
     fmtdate = tmp.strftime(dateformat)
     return fmtdate
-                      
+
 def date_to_sec(fmtdate, dateformat="%m/%d/%Y %H:%M:%S"):
     t_tuple = time.strptime(fmtdate, dateformat)
     sec = time.mktime(t_tuple)
@@ -192,7 +192,7 @@ def date_to_sec(fmtdate, dateformat="%m/%d/%Y %H:%M:%S"):
 def qsim_quit():
     print "pid=", os.getpid()
     os.kill(os.getpid(), signal.SIGINT)
-    
+
 def get_bgsched_config(option, default):
     try:
         value = config.get('bgsched', option)
@@ -220,10 +220,10 @@ class Job (Data):
     enque_time: the time the job start waiting in queue, used by scheduler?
     recovering: indicating that the job was failed in the process of recovering
     '''
-    
+
     fields = Data.fields + ["jobid", "submittime", "queue", "walltime",
                             "nodes","runtime", "start_time", "end_time", "last_hold", "hold_time", "first_yield",
-                            "failure_time", "location", "state", "is_visible", 
+                            "failure_time", "location", "state", "is_visible",
                             "args",
                             "user",
                             "system_state",
@@ -234,8 +234,8 @@ class Job (Data):
                             "has_resources",
                             "attr",
                             "score",
-                            "remain_time",    
-                            ]    
+                            "remain_time",
+                            ]
 
     def __init__(self, spec):
         Data.__init__(self, spec)
@@ -244,16 +244,16 @@ class Job (Data):
         self.jobid = int(spec.get("jobid"))
         self.queue = spec.get("queue", "default")
         #self.queue = "default"
-                
+
         self.submittime = spec.get("submittime")   #in seconds
-        
+
         self.walltime = spec.get("walltime")   #in minutes
-        self.walltime_p = spec.get("walltime_p") #  *AdjEst* 
+        self.walltime_p = spec.get("walltime_p") #  *AdjEst*
         self.user = spec.get("user", "unknown")
         self.project = spec.get("project", "unknown")
         self.nodes = spec.get("nodes", 0)
         self.runtime = spec.get("runtime", 0)
-        self.remain_time = float(self.runtime)       
+        self.remain_time = float(self.runtime)
         self.start_time = spec.get('start_time', '0')
         self.end_time = spec.get('end_time', '0')
         self.last_hold = spec.get('last_hold', 0) # #the time (unix sec) the job starts a latest holding (coscheduling only)
@@ -278,24 +278,24 @@ class Job (Data):
 class JobList(DataList):
     '''the list of job objects'''
     item_cls = Job
-    
+
     def __init__(self, _queue):
         self.queue = _queue
-        
+
 class SimQueue (Queue):
-    '''SimQueue object, extended from cqm.Queue, 
+    '''SimQueue object, extended from cqm.Queue,
      the attribute jobs is qsim.JobList'''
-    
+
     def __init__(self, spec):
         Queue.__init__(self, spec)
         self.jobs = JobList(self)
         self.state = 'running'
         self.tag = 'queue'
-        
+
     def get_joblist(self):
         '''return the job list'''
         return self.jobs
-  
+
 class SimQueueDict(QueueDict):
     '''Queue Dict class for simulating, extended from cqm.QueueDict'''
     item_cls = SimQueue
@@ -305,21 +305,21 @@ class SimQueueDict(QueueDict):
         QueueDict.__init__(self)
         self.policy = policy
         #create default queue
-        self.add_queues([{"name":"default", "policy":"default"}])         
- 
+        self.add_queues([{"name":"default", "policy":"default"}])
+
     def add_jobs(self, specs, callback=None, cargs={}):
-        '''add jobs to queues, if specified queue not exist, create one''' 
+        '''add jobs to queues, if specified queue not exist, create one'''
         queue_names = self.keys()
-        
+
         for spec in specs:
             if spec['queue'] not in queue_names:
                 spec['queue'] = "default"
-              
+
         results = []
          # add the jobs to the appropriate JobList
         for spec in specs:
             results += self[spec['queue']].jobs.q_add([spec], callback, cargs)
-            
+
         return results
 
 class PBSlogger:
@@ -333,18 +333,18 @@ class PBSlogger:
             self.logdir = os.path.expandvars(CP.get('cqm', 'log_dir'))
         except ConfigParser.NoOptionError:
             self.logdir = '.'
-            
+
         if not os.path.isdir(self.logdir):
-            os.system('mkdir %s' % self.logdir)        
-            
+            os.system('mkdir %s' % self.logdir)
+
         #determine log filename
         if name:
             filename = "%s/qsim-%s.log" % (self.logdir, name)
         else:
             self.date = time.localtime()[:3]
             date_string = "%s_%02d_%02d" % self.date
-            filename = "%s/qsim-%s.log" % (self.logdir, date_string)    
-        
+            filename = "%s/qsim-%s.log" % (self.logdir, date_string)
+
         self.logfile = open(filename, 'w')
         self.name = name
 
@@ -358,13 +358,13 @@ class PBSlogger:
             self.logfile.flush()
         except IOError, e:
             logger.error("PBSlogger failure : %s" % e)
-            
+
 class Qsim():
     '''Cobalt Queue Simulator (base class)'''
-    
+
     implementation = "qsim"
     name = "queue-manager"
     logger = logging.getLogger(__name__)
 
     def __init__(self, *args, **kwargs):
-        pass        
+        pass
