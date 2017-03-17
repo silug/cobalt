@@ -28,7 +28,7 @@ class CrayNode(ClusterNode):
         self.role = spec['role'].upper()
         self.attributes['architecture'] = spec['architecture']
         self.segment_details = spec['SocketArray']
-        self.ALPS_status = 'UNKNOWN' #Assume unknown state.
+        self.ALPS_status = spec.get('state', 'UNKNOWN') #Assume unknown state.
         CrayNode.RESOURCE_STATUSES.append('alps-interactive')
 
     def to_dict(self, cooked=False, params=None):
@@ -65,6 +65,10 @@ class CrayNode(ClusterNode):
         node = Element('Node')
         node.set('node_id', str(self.node_id))
         node.set('name', str(self.name))
+        node.set('state', 'UP') #simulator should come with everything idle.
+        node.set('SocketArray', str(self.segment_details))
+        node.set('role', self.role)
+        node.set('architecture', self.attributes['architecture'])
         for key, val in self.attributes.items():
             node.set(key, str(val))
 

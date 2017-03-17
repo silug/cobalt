@@ -2,69 +2,52 @@
 
 '''Cobalt Queue Simulator (for Blue Gene systems) library'''
 
-import ConfigParser
-import copy
 import logging
 import math
 import os
 import os.path
-import random
-import signal
 import sys
 import time
 import types
 
-from ConfigParser import SafeConfigParser, NoSectionError, NoOptionError
-from datetime import datetime
-
-import Cobalt
-import Cobalt.Cqparse
-import Cobalt.Util
-
 from Cobalt.Components.qsim_base import *
-from Cobalt.Components.base import exposed, query, automatic, locking
-from Cobalt.Components.cqm import QueueDict, Queue
-from Cobalt.Components.simulator import Simulator
-from Cobalt.Data import Data, DataList
-from Cobalt.Exceptions import ComponentLookupError
+from Cobalt.Components.base import exposed, query
+from Cobalt.Util import init_cobalt_config, get_config_option
+from Cobalt.Util import expand_num_list
+from Cobalt.Components.simulation.cray_simulator import CraySimulator
+from Cobalt.Components.system.CrayBaseSystem import chain_loc_list
 from Cobalt.Proxy import ComponentProxy, local_components
-from Cobalt.Server import XMLRPCServer, find_intended_location
+from Cobalt.Exceptions import ComponentLookupError
 
-REMOTE_QUEUE_MANAGER = "cluster-queue-manager"
+_logger = logging.getLogger(__name__)
+init_cobalt_config()
 
-WALLTIME_AWARE_CONS = False
+MACHINE_ID = 3 #This is a cray-type system
+REMOTE_QUEUE_MANAGER = get_config_option('simulator', 'remote_queue_manager', 'cluster-queue-manager')
+WALLTIME_AWARE_CONS = get_config_option('simulator', 'walltime_aware_cons', False)
+MACHINE_NAME = get_config_option('simulator', 'machine_name', 'Zinc')
+DEFAULT_MAX_HOLDING_SYS_UTIL = float(get_config_option('simulator', 'default_max_holding_sys_until', 0.6))
+SELF_UNHOLD_INTERVAL = int(get_config_option('simulator', 'self_unhold_interval', 0))
+AT_LEAST_HOLD = int(get_config_option('simulator', 'at_least_hold', 600))
+TOTAL_NODES = int(get_config_option('system', 'size', 96))
+YIELD_THRESHOLD = int(get_config_option('simulator', 'yield_threshold', 0))
+BESTFIT_BACKFILL = bool(get_config_option('simulator', 'bestfit_backfill', False))
+SJF_BACKFILL = bool(get_config_option('simulator', 'sjf_backfill', True))
+MIN_WALLTIME = int(get_config_option('simulator', 'min_walltime', 60))
+MAX_WALLTIME = int(get_config_option('simulator', 'max_walltime', 259200)) #MIRA -- 72 Hours
+BALANCE_FACTOR = int(get_config_option('simulator', 'balance_factor', 1))
 
-MACHINE_ID = 0
-MACHINE_NAME = "Intrepid"
-DEFAULT_MAX_HOLDING_SYS_UTIL = 0.6
-SELF_UNHOLD_INTERVAL = 0
-AT_LEAST_HOLD = 600
-MIDPLANE_SIZE = 512
-#TOTAL_NODES = 40960 #INTREPID
-TOTAL_NODES = 49152 #MIRA
-#TOTAL_MIDPLANE = 80 #INTREPID
-TOTAL_MIDPLANE = 96 #MIRA
-YIELD_THRESHOLD = 0
-
-BESTFIT_BACKFILL = False
-SJF_BACKFILL = True
-
-MIN_WALLTIME = 60
-#MAX_WALLTIME = 43200 #INTREPID -- 12 hours
-MAX_WALLTIME = 259200 #MIRA -- 72 Hours (reservations can do this, 24 for normal operation)
-BALANCE_FACTOR = 1
-
-class BGQsim(Simulator):
+class CrayQsim(CraySimulator):
     '''Cobalt Queue Simulator for Blue Gene systems'''
 
     implementation = "qsim"
     name = "queue-manager"
     alias = "system"
-    logger = logging.getLogger(__name__)
+    logger = _logger
 
     def __init__(self, *args, **kwargs):
 
-        Simulator.__init__(self, *args, **kwargs)
+        super(CrayQsim, self).__init__(*args, **kwargs)
 
         #initialize partitions
         self.sleep_interval = kwargs.get("sleep_interval", 0)
@@ -74,28 +57,9 @@ class BGQsim(Simulator):
         self.sim_end = kwargs.get("bg_trace_end", sys.maxint)
         self.anchor = kwargs.get("Anchor", 0)
         self.backfill = kwargs.get("backfill", "ff")
-
 ###--------Partition related
-        partnames = self._partitions.keys()
-        self.init_partition(partnames)
-        self.inhibit_small_partitions()
-
-        self.total_nodes = TOTAL_NODES
-        self.total_midplane = TOTAL_MIDPLANE
-
-        self.part_size_list = []
-
-        for part in self.partitions.itervalues():
-            if int(part.size) not in self.part_size_list:
-                if part.size >= MIDPLANE_SIZE:
-                    self.part_size_list.append(int(part.size))
-        self.part_size_list.sort()
-
-        self.cached_partitions = self.partitions
-        self._build_locations_cache()
-
 ###-------Job related
-        self.workload_file =  kwargs.get("bgjob")
+        self.workload_file = kwargs.get("cray_job")
         self.output_log = MACHINE_NAME + "-" + kwargs.get("outputlog", "")
 
         self.event_manager = ComponentProxy("event-manager")
@@ -129,7 +93,7 @@ class BGQsim(Simulator):
         histm_alive = False
         try:
             histm_alive = ComponentProxy("history-manager").is_alive()
-        except:
+        except ComponentLookupError:
             #self.logger.error("failed to connect to histm component", exc_info=True)
             histm_alive = False
 
@@ -230,7 +194,6 @@ class BGQsim(Simulator):
         self.define_user_utility_functions()
 
         self.rack_matrix = []
-        self.reset_rack_matrix()
 
         self.batch = kwargs.get("batch", False)
 
@@ -627,7 +590,7 @@ class BGQsim(Simulator):
         ids_str = str(self.event_manager.get_current_event_job())
 
         ids = ids_str.split(':')
-        print "current event=", cur_event, " ", ids
+        #print "current event=", cur_event, " ", ids
         for Id in ids:
 
 
@@ -784,8 +747,8 @@ class BGQsim(Simulator):
                 #self.dbglog.LogMessage(dbgmsg)
                 pass
 
-            if self.walltime_aware_aggr:
-                self.run_matched_job(spec['jobid'], nodelist[0])
+#            if self.walltime_aware_aggr:
+#                self.run_matched_job(spec['jobid'], nodelist[0])
 
         #set tag false, enable scheduling another job at the same time
         self.event_manager.set_go_next(False)
@@ -801,13 +764,12 @@ class BGQsim(Simulator):
         for spec in specs:
             if self.job_hold_dict.has_key(spec['jobid']):
                 start_holding = True
-
-        partitions = updates['location']
+        print updates['location']
+        partitions = chain_loc_list(updates['location'])
         for partition in partitions:
             if not start_holding:
                 self.reserve_partition(partition)
-            partsize = int(self._partitions[partition].size)
-            self.num_busy += partsize
+        self.num_busy += len(partitions)
 
         self.num_running += 1
         self.num_waiting -= 1
@@ -874,528 +836,6 @@ class BGQsim(Simulator):
             print "update job %s=, _key=%s, _value=%s, afterupdate=%s" % (jobid, _key, _value, self.unsubmitted_job_spec_dict[jobid][_key])
 
 ##### system related
-    def init_partition(self, namelist):
-        '''add all paritions and apply activate and enable'''
-        func = self.add_partitions
-        args = ([{'tag':'partition', 'name':partname, 'size':"*",
-                  'functional':False, 'scheduled':False, 'queue':"*",
-                  'deps':[]} for partname in namelist],)
-        apply(func, args)
-
-        func = self.set_partitions
-        args = ([{'tag':'partition', 'name':partname} for partname in namelist],
-                {'scheduled':True, 'functional': True})
-        apply(func, args)
-
-    def inhibit_small_partitions(self):
-        '''set all partition less than 512 nodes not schedulable and functional'''
-        namelist = []
-        for partition in self._partitions.itervalues():
-            if partition.size < MIDPLANE_SIZE:
-                namelist.append(partition.name)
-        func = self.set_partitions
-        args = ([{'tag':'partition', 'name':partname} for partname in namelist],
-                {'scheduled':False})
-        apply(func, args)
-
-    def _find_job_location(self, args, drain_partitions=set(), taken_partition=set(), backfilling=False):
-        jobid = args['jobid']
-        nodes = args['nodes']
-        queue = args['queue']
-        utility_score = args['utility_score']
-        walltime = args['walltime']
-        walltime_p = args['walltime_p']  #*AdjEst*
-        forbidden = args.get("forbidden", [])
-        required = args.get("required", [])
-
-        best_score = sys.maxint
-        best_partition = None
-
-        available_partitions = set()
-
-        requested_location = None
-        if args['attrs'].has_key("location"):
-            requested_location = args['attrs']['location']
-
-        if required:
-            # whittle down the list of required partitions to the ones of the proper size
-            # this is a lot like the stuff in _build_locations_cache, but unfortunately,
-            # reservation queues aren't assigned like real queues, so that code doesn't find
-            # these
-            for p_name in required:
-                available_partitions.add(self.cached_partitions[p_name])
-                available_partitions.update(self.cached_partitions[p_name]._children)
-
-            possible = set()
-            for p in available_partitions:
-                possible.add(p.size)
-
-            desired_size = 64
-            job_nodes = int(nodes)
-            for psize in sorted(possible):
-                if psize >= job_nodes:
-                    desired_size = psize
-                    break
-
-            for p in available_partitions.copy():
-                if p.size != desired_size:
-                    available_partitions.remove(p)
-                elif p.name in self._not_functional_set:
-                    available_partitions.remove(p)
-                elif requested_location and p.name != requested_location:
-                    available_partitions.remove(p)
-        else:
-            for p in self.possible_locations(nodes, queue):
-                skip = False
-                for bad_name in forbidden:
-                    if p.name == bad_name or bad_name in p.children or bad_name in p.parents:
-                        skip = True
-                        break
-
-                if not skip:
-                    if (not requested_location) or (p.name == requested_location):
-                        available_partitions.add(p)
-
-        available_partitions -= drain_partitions
-        now = self.get_current_time()
-        available_partitions = list(available_partitions)
-        available_partitions.sort(key=lambda d: (d.name))
-        best_partition_list = []
-
-        for partition in available_partitions:
-            # if the job needs more time than the partition currently has available, look elsewhere
-            if self.predict_backfill:
-                runtime_estimate = float(walltime_p)   # *Adj_Est*
-            else:
-                runtime_estimate = float(walltime)
-
-            if backfilling:
-                if 60*runtime_estimate > (partition.backfill_time - now):
-                    continue
-
-            if self.reserve_ratio > 0:
-                if self.reservation_violated(self.get_current_time_sec() + 60*runtime_estimate, partition.name):
-                   continue
-
-            if partition.state == "idle":
-                # let's check the impact on partitions that would become blocked
-
-                score = 0
-                for p in partition.parents:
-                    if self.cached_partitions[p].state == "idle" and self.cached_partitions[p].scheduled:
-                        score += 1
-
-                # the lower the score, the fewer new partitions will be blocked by this selection
-                if score < best_score:
-                    best_score = score
-                    best_partition = partition
-
-                    best_partition_list[:] = []
-                    best_partition_list.append(partition)
-                #record equavalent partitions that have same best score
-                elif score == best_score:
-                    best_partition_list.append(partition)
-
-        if self.walltime_aware_cons and len(best_partition_list) > 1:
-            #print "best_partition_list=", [part.name for part in best_partition_list]
-            #walltime aware job allocation (conservative)
-            least_diff = MAXINT
-            for partition in best_partition_list:
-                nbpart = self.get_neighbor_by_partition(partition.name)
-                if nbpart:
-                    nbjob = self.get_running_job_by_partition(nbpart)
-                    if nbjob:
-                        nbjob_remain_length = nbjob.starttime + 60*float(nbjob.walltime) - self.get_current_time_sec()
-                        diff = abs(60*float(walltime) - nbjob_remain_length)
-                        if diff < least_diff:
-                            least_diff = diff
-                            best_partition = partition
-                        msg = "jobid=%s, partition=%s, neighbor part=%s, neighbor job=%s, diff=%s" % (jobid, partition.name, nbpart, nbjob.jobid, diff)
-                        #self.dbglog.LogMessage(msg)
-            msg = "------------job %s allocated to best_partition %s-------------" % (jobid,  best_partition.name)
-            #self.dbglog.LogMessage(msg)
-
-        if best_partition:
-            return {jobid: [best_partition.name]}
-
-    def find_job_location0(self, arg_list, end_times):
-        best_partition_dict = {}
-
-        if self.bridge_in_error:
-            return {}
-
-        # build the cached_partitions structure first  (in simulation conducted in init_part()
-#        self._build_locations_cache()
-
-        # first, figure out backfilling cutoffs per partition (which we'll also use for picking which partition to drain)
-        job_end_times = {}
-        for item in end_times:
-            job_end_times[item[0][0]] = item[1]
-
-        now = self.get_current_time()
-        for p in self.cached_partitions.itervalues():
-            if p.state == "idle":
-                p.backfill_time = now
-            else:
-                p.backfill_time = now + 5*60
-            p.draining = False
-
-        for p in self.cached_partitions.itervalues():
-            if p.name in job_end_times:
-                if job_end_times[p.name] > p.backfill_time:
-                    p.backfill_time = job_end_times[p.name]
-                for parent_name in p.parents:
-                    parent_partition = self.cached_partitions[parent_name]
-                    if p.backfill_time > parent_partition.backfill_time:
-                        parent_partition.backfill_time = p.backfill_time
-
-        for p in self.cached_partitions.itervalues():
-            if p.backfill_time == now:
-                continue
-
-            for child_name in p.children:
-                child_partition = self.cached_partitions[child_name]
-                if child_partition.backfill_time == now or child_partition.backfill_time > p.backfill_time:
-                    child_partition.backfill_time = p.backfill_time
-
-        # first time through, try for starting jobs based on utility scores
-        drain_partitions = set()
-
-        pos = 0
-        for job in arg_list:
-            pos += 1
-            partition_name = self._find_job_location(job, drain_partitions)
-            if partition_name:
-                best_partition_dict.update(partition_name)
-                #logging the scheduled job's postion in the queue, used for measuring fairness,
-                #e.g. pos=1 means job scheduled from the head of the queue
-                dbgmsg = "%s;S;%s;%s;%s;%s" % (self.get_current_time_date(), job['jobid'], pos, job.get('utility_score', -1), partition_name)
-                self.dbglog.LogMessage(dbgmsg)
-                break
-
-            location = self._find_drain_partition(job)
-            if location is not None:
-                for p_name in location.parents:
-                    drain_partitions.add(self.cached_partitions[p_name])
-                for p_name in location.children:
-                    drain_partitions.add(self.cached_partitions[p_name])
-                    self.cached_partitions[p_name].draining = True
-                drain_partitions.add(location)
-                #self.logger.info("job %s is draining %s" % (winning_job['jobid'], location.name))
-                location.draining = True
-
-        # the next time through, try to backfill, but only if we couldn't find anything to start
-        if not best_partition_dict:
-
-            # arg_list.sorlst(self._walltimecmp)
-
-            #for best-fit backfilling (large job first and then longer job first)
-            if not self.backfill == "ff":
-                if self.backfill == "bf":
-                    arg_list = sorted(arg_list, key=lambda d: (-int(d['nodes'])*float(d['walltime'])))
-                elif self.backfill == "sjfb":
-                    arg_list = sorted(arg_list, key=lambda d:float(d['walltime']))
-
-            for args in arg_list:
-                partition_name = self._find_job_location(args, backfilling=True)
-                if partition_name:
-                    self.logger.info("backfilling job %s" % args['jobid'])
-                    best_partition_dict.update(partition_name)
-                    #logging the starting postion in the queue, 0 means backfilled
-                    dbgmsg = "%s;S;%s;0;%s;%s" % (self.get_current_time_date(), args['jobid'], args.get('utility_score', -1), partition_name)
-                    self.dbglog.LogMessage(dbgmsg)
-                    break
-
-#        print "best_partition_dict", best_partition_dict
-
-        return best_partition_dict
-    find_job_location0 = locking(exposed(find_job_location0))
-
-    def find_job_location(self, arg_list, end_times):
-        best_partition_dict = {}
-        minimum_makespan = 100000
-
-        if self.bridge_in_error:
-            return {}
-
-        # build the cached_partitions structure first  (in simulation conducted in init_part()
-#        self._build_locations_cache()
-
-        # first, figure out backfilling cutoffs per partition (which we'll also use for picking which partition to drain)
-        job_end_times = {}
-        for item in end_times:
-            job_end_times[item[0][0]] = item[1]
-
-        now = self.get_current_time()
-        for p in self.cached_partitions.itervalues():
-            if p.state == "idle":
-                p.backfill_time = now
-            else:
-                p.backfill_time = now + 5*60
-            p.draining = False
-
-        for p in self.cached_partitions.itervalues():
-            if p.name in job_end_times:
-                if job_end_times[p.name] > p.backfill_time:
-                    p.backfill_time = job_end_times[p.name]
-                for parent_name in p.parents:
-                    parent_partition = self.cached_partitions[parent_name]
-                    if p.backfill_time > parent_partition.backfill_time:
-                        parent_partition.backfill_time = p.backfill_time
-
-        for p in self.cached_partitions.itervalues():
-            if p.backfill_time == now:
-                continue
-
-            for child_name in p.children:
-                child_partition = self.cached_partitions[child_name]
-                if child_partition.backfill_time == now or child_partition.backfill_time > p.backfill_time:
-                    child_partition.backfill_time = p.backfill_time
-
-        def permute(inputData, outputSoFar):
-            for a in inputData:
-                if a not in outputSoFar:
-                    if len(outputSoFar) == len(inputData) - 1:
-                        yield outputSoFar + [a]
-                    else:
-                        for b in permute(inputData, outputSoFar + [a]): # --- Recursion
-                            yield b
-
-        def permute_first_N(inputData, window_size):
-            if window_size == 1:
-                yield inputData
-            else:
-                list1 = inputData[0:window_size]
-                list2 = inputData[window_size:]
-                for i in permute(list1, []):
-                    list3 = i + list2
-                    yield list3
-
-
-        ###print self.get_current_time_date()
-        #print [job.jobid for job in self.queuing_jobs]
-
-        ###print "length of arg_list=", len(arg_list)
-        #print arg_list
-        permutes = []
-        for i in permute_first_N(arg_list, self.window_size):
-            permutes.append(i)
-
-        ###for perm in permutes:
-            ###print [item.get('jobid') for item in perm],
-        ###print ""
-
-        perm_count = 1
-
-        for perm in permutes:
-
-           # print "round=", perm_count
-            #print "perm=", perm
-            perm_count += 1
-            # first time through, try for starting jobs based on utility scores
-            drain_partitions = set()
-
-            pos = 0
-            last_end = 0
-
-            jl_matches = {}
-
-            for job in perm:
-
-            ###    print "try jobid %s" % job.get('jobid')
-
-                pos += 1
-                job_partition_match = self._find_job_location(job, drain_partitions)
-                if job_partition_match:  # partition found
-               ###     print "found a match=", job_partition_match
-                    jl_matches.update(job_partition_match)
-                    #logging the scheduled job's postion in the queue, used for measuring fairness,
-                    #e.g. pos=1 means job scheduled from the head of the queue
-                    dbgmsg = "%s;S;%s;%s;%s;%s" % (self.get_current_time_date(), job['jobid'], pos, job.get('utility_score', -1), job_partition_match)
-                    self.dbglog.LogMessage(dbgmsg)
-
-                    #pre-allocate job
-                    for partnames in job_partition_match.values():
-                        for partname in partnames:
-                            self.allocate_partition(partname)
-                    #break
-
-                    #calculate makespan this job contribute
-                    if pos <= self.window_size:
-                        expected_end = int(job.get("walltime"))*60
-                        if expected_end > last_end:
-                            last_end = expected_end
-
-              ###          print "expected_end=", expected_end
-
-                else:  # partition not found, start draining
-
-                    location = self._find_drain_partition(job)
-                    if location is not None:
-                       # print "match not found, draing location %s for job %s " % (location, job.get("jobid"))
-                        for p_name in location.parents:
-                            drain_partitions.add(self.cached_partitions[p_name])
-                        for p_name in location.children:
-                            drain_partitions.add(self.cached_partitions[p_name])
-                            self.cached_partitions[p_name].draining = True
-                        drain_partitions.add(location)
-                        #self.logger.info("job %s is draining %s" % (winning_job['jobid'], location.name))
-                        location.draining = True
-
-                        expected_start = location.backfill_time - self.get_current_time_sec()
-                 ###       print "expected_start=", expected_start
-                        expected_end = expected_start + int(job.get("walltime"))*60
-                 ###       print "expected_end=", expected_end
-                        if expected_end > last_end:
-                            last_end = expected_end
-
-            ###print "matches for round ", perm_count-1, jl_matches
-            ###print "last_end=%s, min makespan=%s" % (last_end, minimum_makespan)
-
-            #deallocate in order to reallocate for a next round
-            for partnames in jl_matches.values():
-                for partname in partnames:
-                    self.deallocate_partition(partname)
-
-            if last_end < minimum_makespan:
-                minimum_makespan = last_end
-                best_partition_dict = jl_matches
-
-###            print "best_partition_dict=", best_partition_dict
-   ###         if len(best_partition_dict.keys()) > 1:
-      ###          print "****************"
-
-
-
-        # the next time through, try to backfill, but only if we couldn't find anything to start
-        if not best_partition_dict:
-         ###   print "start backfill-----"
-            # arg_list.sorlst(self._walltimecmp)
-
-            #for best-fit backfilling (large job first and then longer job first)
-            if not self.backfill == "ff":
-                if self.backfill == "bf":
-                    arg_list = sorted(arg_list, key=lambda d: (-int(d['nodes'])*float(d['walltime'])))
-                elif self.backfill == "sjfb":
-                    arg_list = sorted(arg_list, key=lambda d:float(d['walltime']))
-
-            for args in arg_list:
-                partition_name = self._find_job_location(args, backfilling=True)
-                if partition_name:
-                    self.logger.info("backfilling job %s" % args['jobid'])
-                    best_partition_dict.update(partition_name)
-                    #logging the starting postion in the queue, 0 means backfilled
-           #         dbgmsg = "%s;S;%s;0;%s;%s" % (self.get_current_time_date(), args['jobid'], args.get('utility_score', -1), partition_name)
-            #        self.dbglog.LogMessage(dbgmsg)
-                    break
-
-#        print "best_partition_dict", best_partition_dict
-
-        return best_partition_dict
-    find_job_location = locking(exposed(find_job_location))
-
-    def allocate_partition(self, name):
-        """temperarly allocate a partition avoiding being allocated by other job"""
-        #print "in allocate_partition, name=", name
-        try:
-            part = self.partitions[name]
-        except KeyError:
-            self.logger.error("reserve_partition(%r, %r) [does not exist]" % (name, size))
-            return False
-        if part.state == "idle":
-            part.state = "allocated"
-            for p in part._parents:
-                if p.state == "idle":
-                    p.state = "temp_blocked"
-            for p in part._children:
-                if p.state == "idle":
-                    p.state = "temp_blocked"
-
-    def deallocate_partition(self, name):
-        """the reverse process of allocate_partition"""
-        part = self.partitions[name]
-
-        if part.state == "allocated":
-            part.state = "idle"
-
-            for p in part._parents:
-                if p.state == "temp_blocked":
-                    p.state = "idle"
-            for p in part._children:
-                if p.state != "temp_blocked":
-                    p.state = "idle"
-
-    def release_partition (self, name):
-        """Release a reserved partition.
-
-        Arguments:
-        name -- name of the partition to release
-        """
-        try:
-            partition = self.partitions[name]
-        except KeyError:
-            self.logger.error("release_partition(%r) [already free]" % (name))
-            return False
-        if not partition.state == "busy":
-            self.logger.info("release_partition(%r) [not busy]" % (name))
-            return False
-
-        self._partitions_lock.acquire()
-        try:
-            partition.state = "idle"
-        except:
-            self.logger.error("error in release_partition", exc_info=True)
-        self._partitions_lock.release()
-
-        # explicitly unblock the blocked partitions
-        self.update_partition_state()
-
-        self.logger.info("release_partition(%r)" % (name))
-        return True
-    release_partition = exposed(release_partition)
-
-
-    def reserve_partition (self, name, size=None):
-        """Reserve a partition and block all related partitions.
-
-        Arguments:
-        name -- name of the partition to reserve
-        size -- size of the process group reserving the partition (optional)
-        """
-
-        try:
-            partition = self.partitions[name]
-        except KeyError:
-            self.logger.error("reserve_partition(%r, %r) [does not exist]" % (name, size))
-            return False
-#        if partition.state != "allocated":
-#            self.logger.error("reserve_partition(%r, %r) [%s]" % (name, size, partition.state))
-#            return False
-        if not partition.functional:
-            self.logger.error("reserve_partition(%r, %r) [not functional]" % (name, size))
-        if size is not None and size > partition.size:
-            self.logger.error("reserve_partition(%r, %r) [size mismatch]" % (name, size))
-            return False
-
-        if partition.state == "busy":
-            print "try to reserve a busy partition: %s!!!" % name
-            return False
-
-        #self._partitions_lock.acquire()
-        try:
-            partition.state = "busy"
-            partition.reserved_until = False
-        except:
-            self.logger.error("error in reserve_partition", exc_info=True)
-            print "try to reserve a busy partition!!"
-        #self._partitions_lock.release()
-        # explicitly call this, since the above "busy" is instantaneously available
-        self.update_partition_state()
-
-        self.logger.info("reserve_partition(%r, %r)" % (name, size))
-        return True
-    reserve_partition = exposed(reserve_partition)
-
 
 #####--------utility functions
 
@@ -1586,11 +1026,6 @@ class BGQsim(Simulator):
         current_time = self.get_current_time_sec()
         next_time = self.event_manager.get_next_event_time_sec()
 
-        if next_time > current_time:
-            time_length = next_time - current_time
-            idle_midplanes = len(self.get_midplanes_by_state('idle'))
-            idle_node = idle_midplanes * MIDPLANE_SIZE
-            loss = time_length * idle_node
         return loss
 
     def total_capacity_loss_rate(self):
@@ -1606,127 +1041,11 @@ class BGQsim(Simulator):
         print "capacity loss rate=", loss_rate
         return loss_rate
 
-    def equal_partition(self, nodeno1, nodeno2):
-        proper_partsize1 = 0
-        proper_partsize2 = 1
-        for psize in self.part_size_list:
-            if psize >= nodeno1:
-                proper_partsize1 = psize
-                break
-        for psize in self.part_size_list:
-            if psize >= nodeno2:
-                proper_partsize2 = psize
-                break
-        if proper_partsize1 == proper_partsize2:
-            return True
-        else:
-            return False
-
-    def run_matched_job(self, jobid, partition):
-        '''implementation of aggresive scheme in sc10 submission'''
-
-        #get neighbor partition (list) for running
-        partlist = []
-        nbpart = self.get_neighbor_by_partition(partition)
-        if nbpart:
-            nb_partition = self._partitions[nbpart]
-            if nb_partition.state != "idle":
-                #self.dbglog.LogMessage("return point 1")
-                return None
-        else:
-            #self.dbglog.LogMessage("return point 2")
-            return None
-        partlist.append(nbpart)
-
-        #find a job in the queue whose length matches the top-queue job
-        topjob = self.get_live_job_by_id(jobid)
-
-        base_length = float(topjob.walltime)
-        #print "job %d base_length=%s" % (jobid, base_length)
-        base_nodes = int(topjob.nodes)
-
-        min_diff = MAXINT
-        matched_job = None
-        msg = "queueing jobs=%s" % ([job.jobid for job in self.queuing_jobs])
-        #self.dbglog.LogMessage(msg)
-
-        for job in self.queuing_jobs:
-            #self.dbglog.LogMessage("job.nodes=%s, base_nodes=%s" % (job.nodes, base_nodes))
-
-            if self.equal_partition(int(job.nodes), base_nodes):
-                length = float(job.walltime)
-                #self.dbglog.LogMessage("length=%s, base_length=%s" % (length, base_length))
-                if length > base_length:
-                    continue
-                diff = abs(base_length - length)
-                #print "diff=", diff
-                #self.dbglog.LogMessage("diff=%s" % (diff))
-                if diff < min_diff:
-                    min_diff = diff
-                    matched_job = job
-
-        if matched_job == None:
-            pass
-            #self.dbglog.LogMessage("return point 3")
-        else:
-            #self.dbglog.LogMessage(matched_job.jobid)
-            pass
-
-        #run the matched job on the neiborbor partition
-        if matched_job and partlist:
-            self.start_job([{'tag':'job', 'jobid':matched_job.jobid}], {'location':partlist})
-            msg = "job=%s, partition=%s, mached_job=%s, matched_partitions=%s" % (jobid, partition, matched_job.jobid, partlist)
-            self.dbglog.LogMessage(msg)
-
-        return 1
-
-    def get_neighbor_by_partition(self, partname):
-        '''get the neighbor partition by given partition name.
-          note: this functionality is specific to intrepid partition naming and for partition size smaller than 4k'''
-        nbpart = ""
-        partition = self._partitions[partname]
-        partsize = partition.size
-        if partsize == 512:  #e.g. ANL-R12-M0-512  --> ANL-R12-M1-512
-            nbpart = "%s%s%s" % (partname[0:9], 1-int(partname[9]), partname[10:])  #reverse the midplane
-        elif partsize == 1024:  #e.g.  ANL-R12-1024 --> ANL-R13-1024
-            rackno = int(partname[6])
-            if rackno % 2 == 0:  #even
-                nbrackno = rackno + 1
-            else:
-                nbrackno = rackno - 1
-            nbpart = "%s%s%s" % (partname[0:6], nbrackno, partname[7:])    #find the neighbor rack
-        elif partsize == 2048:  #e.g. ANL-R12-R13-2048 --> ANL-R14-R15-2048
-            rackno1 = int(partname[6])
-            rackno2 = int(partname[10])
-            if rackno1 % 4 == 0:  #0, 4 ...
-                nbrackno1 = rackno1 + 2
-                nbrackno2 = rackno2 + 2
-            else:  #2, 6
-                nbrackno1 = rackno1 - 2
-                nbrackno2 = rackno2 - 2
-            nbpart = "%s%s%s%s%s" % (partname[0:6], nbrackno1, partname[7:10], nbrackno2, partname[11:])
-        elif partsize == 4096:  #e.g. ANL-R10-R13-4096 --> ANL-R14-R17-4096
-            rackno1 = int(partname[6])
-            rackno2 = int(partname[10])
-            if rackno1 == 0:
-                nbrackno1 = rackno1 + 4
-                nbrackno2 = rackno2 + 4
-            elif rackno1 == 4:
-                nbrackno1 = rackno1 - 4
-                nbrackno2 = rackno2 - 4
-            nbpart = "%s%s%s%s%s" % (partname[0:6], nbrackno1, partname[7:10], nbrackno2, partname[11:])
-        return nbpart
-
-    def get_running_job_by_partition(self, partname):
-        '''return a running job given the partition name'''
-        partition = self._partitions[partname]
-        if partition.state == "idle":
-            return None
-        for rjob in self.running_jobs:
-            partitions = rjob.location
-            if partname in partitions:
-                return rjob
-        return None
+    @locking
+    @exposed
+    def find_job_location(self, *args, **kwargs):
+        print args, kwargs
+        return super(CrayQsim, self).find_job_location(*args, **kwargs)
 
 #####--begin--CoScheduling stuff
     def init_jobid_qtime_pairs(self):
@@ -1867,7 +1186,7 @@ class BGQsim(Simulator):
             partsize += int(partname.split("-")[-1])
 
         job_id = spec['jobid']
-        if current_holden_nodes + partsize < self.max_holding_sys_util * self.total_nodes:
+        if current_holden_nodes + partsize < self.max_holding_sys_util * TOTAL_NODES:
             self.job_hold_dict[spec['jobid']] = nodelist
 
             if not self.first_hold_time_dict.has_key(job_id):
@@ -2023,211 +1342,211 @@ class BGQsim(Simulator):
 
 #####----------display stuff
 
-    def get_midplanes_by_state(self, status):
-        idle_midplane_list = []
-
-        for partition in self._partitions.itervalues():
-            if partition.size == MIDPLANE_SIZE:
-                if partition.state == status:
-                    idle_midplane_list.append(partition.name)
-
-        return idle_midplane_list
-
-    def show_resource(self):
-        '''print rack_matrix'''
-
-        self.mark_matrix()
-
-        for row in self.rack_matrix:
-            for rack in row:
-                if rack[0] == 1:
-                    print "*",
-                elif rack[0] == 0:
-                    print GREENS + 'X' + ENDC,
-                elif rack[0] == 2:
-                    print YELLOWS + '+' + ENDC,
-                else:
-                    print rack[0],
-            print '\r'
-            for rack in row:
-                if rack[1] == 1:
-                    print "*",
-                elif rack[1] == 0:
-                    print GREENS + 'X' + ENDC,
-                elif rack[1] == 2:
-                    print YELLOWS + '+' + ENDC,
-                else:
-                    print rack[1],
-            print '\r'
-
-    def get_holden_midplanes(self):
-        '''return a list of name of 512-size partitions that are in the job_hold_list'''
-        midplanes = []
-        for partlist in self.job_hold_dict.values():
-            partname = partlist[0]
-            midplanes.extend(self.get_midplanes(partname))
-        return midplanes
-
-    def get_midplanes(self, partname):
-        '''return a list of sub-partitions each contains 512-nodes(midplane)'''
-        midplane_list = []
-        partition = self._partitions[partname]
-
-        if partition.size == MIDPLANE_SIZE:
-            midplane_list.append(partname)
-        elif partition.size > MIDPLANE_SIZE:
-            children = partition.children
-            for part in children:
-                if self._partitions[part].size == MIDPLANE_SIZE:
-                    midplane_list.append(part)
-        else:
-            parents = partition.parents
-            for part in parents:
-                if self._partitions[part].size == MIDPLANE_SIZE:
-                    midplane_list.append(part)
-
-        return midplane_list
-
-    def mark_matrix(self):
-        idle_midplanes = self.get_midplanes_by_state('idle')
-        self.reset_rack_matrix()
-        for name in idle_midplanes:  #sample name for a midplane:  ANL-R15-M0-512
-            print name
-            row = int(name[5])
-            col = int(name[6])
-            M = int(name[9])
-            self.rack_matrix[row][col][M] = 1
-        holden_midplanes = self.get_holden_midplanes()
-        if self.coscheduling and self.cosched_scheme == "hold":
-            for name in holden_midplanes:
-                row = int(name[5])
-                col = int(name[6])
-                M = int(name[9])
-                self.rack_matrix[row][col][M] = 2
-
-    def reset_rack_matrix(self):
-        self.rack_matrix = [
-                [[0,0], [0,0], [0,0], [0,0], [0,0], [0,0], [0,0], [0,0]],
-                [[0,0], [0,0], [0,0], [0,0], [0,0], [0,0], [0,0], [0,0]],
-                [[0,0], [0,0], [0,0], [0,0], [0,0], [0,0], [0,0], [0,0]],
-                [[0,0], [0,0], [0,0], [0,0], [0,0], [0,0], [0,0], [0,0]],
-                [[0,0], [0,0], [0,0], [0,0], [0,0], [0,0], [0,0], [0,0]],
-            ]
-        #self.rack_matrix = [[[0,0] for i in range(8)] for j in range(5)]
+#    def get_midplanes_by_state(self, status):
+#        idle_midplane_list = []
+#
+#        for partition in self._partitions.itervalues():
+#            if partition.size == MIDPLANE_SIZE:
+#                if partition.state == status:
+#                    idle_midplane_list.append(partition.name)
+#
+#        return idle_midplane_list
+#
+#    def show_resource(self):
+#        '''print rack_matrix'''
+#
+#        self.mark_matrix()
+#
+#        for row in self.rack_matrix:
+#            for rack in row:
+#                if rack[0] == 1:
+#                    print "*",
+#                elif rack[0] == 0:
+#                    print GREENS + 'X' + ENDC,
+#                elif rack[0] == 2:
+#                    print YELLOWS + '+' + ENDC,
+#                else:
+#                    print rack[0],
+#            print '\r'
+#            for rack in row:
+#                if rack[1] == 1:
+#                    print "*",
+#                elif rack[1] == 0:
+#                    print GREENS + 'X' + ENDC,
+#                elif rack[1] == 2:
+#                    print YELLOWS + '+' + ENDC,
+#                else:
+#                    print rack[1],
+#            print '\r'
+#
+#    def get_holden_midplanes(self):
+#        '''return a list of name of 512-size partitions that are in the job_hold_list'''
+#        midplanes = []
+#        for partlist in self.job_hold_dict.values():
+#            partname = partlist[0]
+#            midplanes.extend(self.get_midplanes(partname))
+#        return midplanes
+#
+#    def get_midplanes(self, partname):
+#        '''return a list of sub-partitions each contains 512-nodes(midplane)'''
+#        midplane_list = []
+#        partition = self._partitions[partname]
+#
+#        if partition.size == MIDPLANE_SIZE:
+#            midplane_list.append(partname)
+#        elif partition.size > MIDPLANE_SIZE:
+#            children = partition.children
+#            for part in children:
+#                if self._partitions[part].size == MIDPLANE_SIZE:
+#                    midplane_list.append(part)
+#        else:
+#            parents = partition.parents
+#            for part in parents:
+#                if self._partitions[part].size == MIDPLANE_SIZE:
+#                    midplane_list.append(part)
+#
+#        return midplane_list
+#
+#    def mark_matrix(self):
+#        idle_midplanes = self.get_midplanes_by_state('idle')
+#        self.reset_rack_matrix()
+#        for name in idle_midplanes:  #sample name for a midplane:  ANL-R15-M0-512
+#            print name
+#            row = int(name[5])
+#            col = int(name[6])
+#            M = int(name[9])
+#            self.rack_matrix[row][col][M] = 1
+#        holden_midplanes = self.get_holden_midplanes()
+#        if self.coscheduling and self.cosched_scheme == "hold":
+#            for name in holden_midplanes:
+#                row = int(name[5])
+#                col = int(name[6])
+#                M = int(name[9])
+#                self.rack_matrix[row][col][M] = 2
+#
+#    def reset_rack_matrix(self):
+#        self.rack_matrix = [
+#                [[0,0], [0,0], [0,0], [0,0], [0,0], [0,0], [0,0], [0,0]],
+#                [[0,0], [0,0], [0,0], [0,0], [0,0], [0,0], [0,0], [0,0]],
+#                [[0,0], [0,0], [0,0], [0,0], [0,0], [0,0], [0,0], [0,0]],
+#                [[0,0], [0,0], [0,0], [0,0], [0,0], [0,0], [0,0], [0,0]],
+#                [[0,0], [0,0], [0,0], [0,0], [0,0], [0,0], [0,0], [0,0]],
+#            ]
+#        #self.rack_matrix = [[[0,0] for i in range(8)] for j in range(5)]
 
     def print_screen(self, cur_event=""):
         '''print screen, show number of waiting jobs, running jobs, busy_nodes%'''
 
         #os.system('clear')
 
-        print "Blue Gene"
-
-        if PRINT_SCREEN == False:
-            print "simulation in progress, please wait"
-            return
-
-        current_datetime = self.event_manager.get_current_date_time()
-        print "%s %s" % (current_datetime, cur_event)
-
-        self.show_resource()
-
-#        print "number of waiting jobs: ", self.num_waiting
-
-
-#        max_wait, avg_wait = self.get_current_max_avg_queue_time()
-
-        #print "maxium waiting time (min): ", int(max_wait / 60.0)
-        #print "average waiting time (min): ", int(avg_wait / 60.0)
-
-        waiting_job_bar = REDS
-        for i in range(self.num_waiting):
-            waiting_job_bar += "*"
-        waiting_job_bar += ENDC
-
-        print waiting_job_bar
-
-        holding_jobs = len(self.job_hold_dict.keys())
-        holding_midplanes = 0
-        hold_partitions = []
-        for partlist in self.job_hold_dict.values():
-            host = partlist[0]
-            hold_partitions.append(host)
-            nodes = int(host.split("-")[-1])
-            holding_midplanes += nodes / MIDPLANE_SIZE
-
-        print "number of running jobs: ", self.num_running
-        running_job_bar = BLUES
-        for i in range(self.num_running):
-            running_job_bar += "+"
-        running_job_bar += ENDC
-        print running_job_bar
-
-        print "number of holding jobs: ", holding_jobs
-
-        print "number of holden midplanes: ", holding_midplanes
-        #print "holden partitions: ", hold_partitions
-
-        midplanes = self.num_busy / MIDPLANE_SIZE
-        print "number of busy midplanes: ", midplanes
-        print "system utilization: ", float(self.num_busy) / self.total_nodes
-
-        busy_midplane_bar = GREENS
-
-        i = 0
-        while i < midplanes:
-            busy_midplane_bar += "x"
-            i += 1
-        j = 0
-        busy_midplane_bar += ENDC
-        busy_midplane_bar += YELLOWS
-        while j < holding_midplanes:
-            busy_midplane_bar += "+"
-            j += 1
-            i += 1
-        busy_midplane_bar += ENDC
-        for k in range(i, self.total_midplane):
-            busy_midplane_bar += "-"
-        busy_midplane_bar += REDS
-        busy_midplane_bar += "|"
-        busy_midplane_bar += ENDC
-        print busy_midplane_bar
-        print "completed jobs/total jobs:  %s/%s" % (self.num_end, self.total_job)
-
-        progress = 100 * self.num_end / self.total_job
-
-        progress_bar = ""
-        i = 0
-        while i < progress:
-            progress_bar += "="
-            i += 1
-        for j in range(i, 100):
-            progress_bar += "-"
-        progress_bar += "|"
-        print progress_bar
-
-        #if self.get_current_time_sec() > 1275393600:
-         #   time.sleep(1)
-
-        if self.sleep_interval:
-            time.sleep(self.sleep_interval)
-
-        print "waiting jobs:", [(job.jobid, job.nodes) for job in self.queuing_jobs]
-
-#        wait_jobs = [job for job in self.queues.get_jobs([{'is_runnable':True}])]
+#        print "Blue Gene"
 #
-#        if wait_jobs:
-#            wait_jobs.sort(self.utilitycmp)
-#            top_jobs = wait_jobs[0:5]
-#        else:
-#            top_jobs = []
+#        if PRINT_SCREEN == False:
+#            print "simulation in progress, please wait"
+#            return
 #
-#        if top_jobs:
-#            print "high priority waiting jobs: ", [(job.jobid, job.nodes) for job in top_jobs]
-#        else:
-#            print "hig priority waiting jobs:"
-
-        #print "holding jobs: ", [(k,v[0].split("-")[-1]) for k, v in self.job_hold_dict.iteritems()]
-        print "\n\n"
+#        current_datetime = self.event_manager.get_current_date_time()
+#        print "%s %s" % (current_datetime, cur_event)
+#
+#        self.show_resource()
+#
+##        print "number of waiting jobs: ", self.num_waiting
+#
+#
+##        max_wait, avg_wait = self.get_current_max_avg_queue_time()
+#
+#        #print "maxium waiting time (min): ", int(max_wait / 60.0)
+#        #print "average waiting time (min): ", int(avg_wait / 60.0)
+#
+#        waiting_job_bar = REDS
+#        for i in range(self.num_waiting):
+#            waiting_job_bar += "*"
+#        waiting_job_bar += ENDC
+#
+#        print waiting_job_bar
+#
+#        holding_jobs = len(self.job_hold_dict.keys())
+#        holding_midplanes = 0
+#        hold_partitions = []
+#        for partlist in self.job_hold_dict.values():
+#            host = partlist[0]
+#            hold_partitions.append(host)
+#            nodes = int(host.split("-")[-1])
+#            holding_midplanes += nodes / MIDPLANE_SIZE
+#
+#        print "number of running jobs: ", self.num_running
+#        running_job_bar = BLUES
+#        for i in range(self.num_running):
+#            running_job_bar += "+"
+#        running_job_bar += ENDC
+#        print running_job_bar
+#
+#        print "number of holding jobs: ", holding_jobs
+#
+#        print "number of holden midplanes: ", holding_midplanes
+#        #print "holden partitions: ", hold_partitions
+#
+#        midplanes = self.num_busy / MIDPLANE_SIZE
+#        print "number of busy midplanes: ", midplanes
+#        print "system utilization: ", float(self.num_busy) / TOTAL_NODES
+#
+#        busy_midplane_bar = GREENS
+#
+#        i = 0
+#        while i < midplanes:
+#            busy_midplane_bar += "x"
+#            i += 1
+#        j = 0
+#        busy_midplane_bar += ENDC
+#        busy_midplane_bar += YELLOWS
+#        while j < holding_midplanes:
+#            busy_midplane_bar += "+"
+#            j += 1
+#            i += 1
+#        busy_midplane_bar += ENDC
+#        for k in range(i, self.total_midplane):
+#            busy_midplane_bar += "-"
+#        busy_midplane_bar += REDS
+#        busy_midplane_bar += "|"
+#        busy_midplane_bar += ENDC
+#        print busy_midplane_bar
+#        print "completed jobs/total jobs:  %s/%s" % (self.num_end, self.total_job)
+#
+#        progress = 100 * self.num_end / self.total_job
+#
+#        progress_bar = ""
+#        i = 0
+#        while i < progress:
+#            progress_bar += "="
+#            i += 1
+#        for j in range(i, 100):
+#            progress_bar += "-"
+#        progress_bar += "|"
+#        print progress_bar
+#
+#        #if self.get_current_time_sec() > 1275393600:
+#         #   time.sleep(1)
+#
+#        if self.sleep_interval:
+#            time.sleep(self.sleep_interval)
+#
+#        print "waiting jobs:", [(job.jobid, job.nodes) for job in self.queuing_jobs]
+#
+##        wait_jobs = [job for job in self.queues.get_jobs([{'is_runnable':True}])]
+##
+##        if wait_jobs:
+##            wait_jobs.sort(self.utilitycmp)
+##            top_jobs = wait_jobs[0:5]
+##        else:
+##            top_jobs = []
+##
+##        if top_jobs:
+##            print "high priority waiting jobs: ", [(job.jobid, job.nodes) for job in top_jobs]
+##        else:
+##            print "hig priority waiting jobs:"
+#
+#        #print "holding jobs: ", [(k,v[0].split("-")[-1]) for k, v in self.job_hold_dict.iteritems()]
+#        print "\n\n"
 
     def post_simulation_handling(self):
         '''post screen after simulation completes'''
@@ -2242,9 +1561,13 @@ class BGQsim(Simulator):
         for job in self.started_job_dict.itervalues():
             total_wait += job.get('start_time') - job.get('submittime')
             count += 1
-        print "average waiting=", (total_wait / count)/60.0
+        if len(self.started_job_dict) > 0:
+            print "average waiting=", (total_wait / count)/60.0
+        else:
+            _logger.warning('No Jobs Started!')
 
         if self.adaptive:
+            avg_qd = 'N/A'
             for qd in self.queue_depth_data:
                 avg_qd = sum(self.queue_depth_data) / len(self.queue_depth_data)
             print "average queue depth=", avg_qd

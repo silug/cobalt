@@ -11,6 +11,7 @@ import Cobalt.Util
 from Cobalt.Components.evsim import EventSimulator
 from Cobalt.Components.bqsim import BGQsim
 from Cobalt.Components.cqsim import ClusterQsim
+from Cobalt.Components.cray_sim import CrayQsim
 from Cobalt.Components.histm import HistoryManager
 from Cobalt.Components.base import run_component
 from Cobalt.Components.slp import TimingServiceLocator
@@ -20,7 +21,7 @@ from Cobalt.Proxy import ComponentProxy, local_components
 from datetime import datetime
 import time
 
-arg_list = ['bgjob', 'cjob', 'config_file', 'outputlog', 'sleep_interval',
+arg_list = ['bgjob', 'cjob', 'cray_job', 'config_file', 'outputlog', 'sleep_interval',
             'predict', 'coscheduling', 'wass', 'BG_Fraction', 'cluster_fraction',
             'bg_trace_start', 'bg_trace_end', 'c_trace_start', 'c_trace_end',
             'Anchor', 'anchor', 'vicinity', 'mate_ratio', 'batch', 'backfill', 'reserve_ratio',
@@ -97,6 +98,8 @@ def integrated_main(options):
         bqsim = BGQsim(**options)
     if opts.cjob:
         cqsim = ClusterQsim(**options)
+    if opts.cray_job:
+        cray_qsim = CrayQsim(**options)
 
     if opts.bgjob and opts.cjob and opts.coscheduling:
         print "inserting 'unhold' events into event list..."
@@ -134,6 +137,8 @@ def integrated_main(options):
         bqsim.post_simulation_handling()
     if opts.cjob:
         cqsim.post_simulation_handling()
+    if opts.cray_job:
+        cray_qsim.post_simulation_handling()
 
     endtime_sec = time.time()
     print "----Simulation is finished, please check output log for further analysis.----"
@@ -147,6 +152,8 @@ if __name__ == "__main__":
         help="file name of the job trace (when scheduling for bg system only)")
     p.add_option("-c", "--cjob", dest="cjob", type="string",
         help="file name of the job trace from the cluster system")
+    p.add_option("-y", "--cray_job", dest="cray_job", type="string",
+        help="file name of the job trace from the cray system")
     p.add_option("-p", "--partition", dest="config_file", type="string",
         help="file name of the partition configuration of the Blue Gene system")
     p.add_option("-o", "--output", dest="outputlog", type="string",
@@ -214,7 +221,7 @@ if __name__ == "__main__":
 
     opts, args = p.parse_args()
 
-    if not opts.bgjob and not opts.cjob:
+    if not opts.bgjob and not opts.cjob and not opts.cray_job:
         print "Error: Please specify at least one job trace!"
         p.print_help()
         sys.exit()

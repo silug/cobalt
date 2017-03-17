@@ -2,54 +2,46 @@
 
 '''Cobalt Event Simulator'''
 
-import ConfigParser
-import copy
 import logging
-import math
-import os
-import os.path
-import random
-import signal
-import sys
 import time
-import inspect
-
-from ConfigParser import SafeConfigParser, NoSectionError, NoOptionError
 from datetime import datetime
-import time
 
 import Cobalt
 import Cobalt.Cqparse
-import Cobalt.Util
 import Cobalt.Components.bgsched
-
 from Cobalt.Components.bgsched import BGSched
 from Cobalt.Components.metric_mon import metricmon
-from Cobalt.Components.base import Component, exposed, automatic, query, locking
-from Cobalt.Components.cqm import QueueDict, Queue
-from Cobalt.Components.simulator import Simulator
-from Cobalt.Data import Data, DataList
-from Cobalt.Exceptions import ComponentLookupError
-from Cobalt.Proxy import ComponentProxy, local_components
-from Cobalt.Server import XMLRPCServer, find_intended_location
+from Cobalt.Components.base import Component, exposed
+from Cobalt.Data import Data
+from Cobalt.Proxy import ComponentProxy
+from Cobalt.Util import init_cobalt_config, get_config_option
+
+init_cobalt_config()
 
 logging.basicConfig()
 logger = logging.getLogger('evsim')
 
-no_of_machine = 2
 INTREPID = 0
 EUREKA = 1
 BOTH = 2
+CRAY = 3
 MMON = 4
-UNHOLD_INTERVAL = 1200
-MMON_INTERVAL = 1800
+#UNHOLD_INTERVAL = 1200
+#MMON_INTERVAL = 1800
 
-SHOW_SCREEN_LOG = False
+#SHOW_SCREEN_LOG = False
 
-CP = ConfigParser.ConfigParser()
-CP.read(Cobalt.CONFIG_FILES)
-if CP.has_section('evsim') and CP.get("evsim", "no_of_machines"):
-    no_of_machine = CP.get("evsim", "no_of_machines")
+MACHINE_TYPES = {'CRAY_XC40': 3,
+                 'BLUE_GENE': 0,
+                 'GENERAL_CLUSTER':1,
+                 'MMON': 4,
+                 }
+
+#no_of_machine = int(get_config_option('evsim', 'no_of_machine', 1))
+SHOW_SCREEN_LOG = get_config_option('evsim', 'show_screen_log', False)
+UNHOLD_INTERVAL = int(get_config_option('evsim', 'unhold_interval', 1200))
+MMON_INTERVAL = int(get_config_option('evsim', 'mmon_interval', 1800))
+
 
 def sec_to_date(sec, dateformat="%m/%d/%Y %H:%M:%S"):
     tmp = datetime.fromtimestamp(sec)
@@ -61,10 +53,10 @@ def date_to_sec(fmtdate, dateformat="%m/%d/%Y %H:%M:%S"):
     sec = time.mktime(t_tuple)
     return sec
 
-class Sim_bg_Sched (BGSched):
+class SimBGSched(BGSched):
 
     def __init__(self, *args, **kwargs):
-        BGSched.__init__(self, *args, **kwargs)
+        super(SimBGSched, self).__init__(*args, **kwargs)
 
         self.get_current_time = ComponentProxy("event-manager").get_current_time
 
@@ -74,18 +66,19 @@ class Sim_bg_Sched (BGSched):
         else:
             self.running_job_walltime_prediction = False
 
-class Sim_Cluster_Sched (BGSched):
+class SimClusterSched(BGSched):
+
+    COMP_QUEUE_MANAGER = "cluster-queue-manager"
+    COMP_SYSTEM = "cluster-system"
 
     def __init__(self, *args, **kwargs):
         BGSched.__init__(self, *args, **kwargs)
         self.get_current_time = ComponentProxy("event-manager").get_current_time
-        self.COMP_QUEUE_MANAGER = "cluster-queue-manager"
-        self.COMP_SYSTEM = "cluster-system"
         self.queues = Cobalt.Components.bgsched.QueueDict(self.COMP_QUEUE_MANAGER)
         self.jobs = Cobalt.Components.bgsched.JobDict(self.COMP_QUEUE_MANAGER)
         self.running_job_walltime_prediction = False
 
-class SimEvent (Data):
+class SimEvent(Data):
 
     """A simulated event
 
@@ -103,7 +96,7 @@ class SimEvent (Data):
         "jobid", "location",
     ]
 
-    def __init__ (self, spec):
+    def __init__(self, spec):
         """Initialize a new partition."""
         Data.__init__(self, spec)
         spec = spec.copy()
@@ -137,8 +130,8 @@ class EventSimulator(Component):
 
         self.finished = False
 
-        self.bgsched = Sim_bg_Sched(**kwargs)
-        #self.csched = Sim_Cluster_Sched()
+        self.bgsched = SimBGSched(**kwargs)
+        #self.csched = SimClusterSched()
 
         self.mmon = metricmon()
 
@@ -337,10 +330,14 @@ class EventSimulator(Component):
 
         if machine == INTREPID:
             self.bgsched.schedule_jobs()
-        if machine == EUREKA:
-            self.csched.schedule_jobs()
+        #if machine == EUREKA:
+        #    self.csched.schedule_jobs()
         if machine == MMON:
             self.mmon.metric_monitor()
+        #add invocation for Cray
+        if machine == MACHINE_TYPES['CRAY_XC40']:
+            print "scheduling jobs"
+            self.bgsched.schedule_jobs()
 
         if self.go_next:
             ComponentProxy("queue-manager").calc_loss_of_capacity()
