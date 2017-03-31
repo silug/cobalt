@@ -11,7 +11,7 @@ import Cobalt.Util
 from Cobalt.Components.evsim import EventSimulator
 from Cobalt.Components.bqsim import BGQsim
 from Cobalt.Components.cqsim import ClusterQsim
-from Cobalt.Components.cray_sim import CrayQsim
+from Cobalt.Components.simulation.cray_sim import CrayQsim
 from Cobalt.Components.histm import HistoryManager
 from Cobalt.Components.base import run_component
 from Cobalt.Components.slp import TimingServiceLocator
