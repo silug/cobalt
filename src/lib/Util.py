@@ -270,9 +270,11 @@ def dgetopt(arglist, opt, vopt, msg):
     return ret, list(args)
 
 def merge_nodelist(locations):
-    '''create a set of dashed-ranges from a node list'''
-    reg = re.compile(r'(\D+)(\d+)')
+    '''create a set of dashed-ranges from a node list
 
+    '''
+    reg = re.compile(r'(\D+)(\d+)')
+    cray_loc = re.compile(r'^(\d+)')
     # create a dictionary with a key for each node prefix,
     # with sorted lists of node numbers as the values
     noderanges = {}
@@ -280,32 +282,37 @@ def merge_nodelist(locations):
     prefix_max_digits = {}
     prefix_format_str = {}
 
+    ret = []
     #if this doesn't have a prefix, like a Cray nidlist, short circut
     if len(locations) >= 1:
-        if reg.match(locations[0]) is None:
+        if cray_loc.match(locations[0]) is not None:
             #this is cray-style
             return compact_num_list(locations)
 
     for name in locations:
-        prefix = reg.match(name).group(1)
-        nodenum = reg.match(name).group(2)
-        num_digits = len(nodenum)
-        newnum = int(nodenum)
-        if not prefix in noderanges:
-            noderanges[prefix] = [newnum]
-            prefix_min_digits[prefix] = num_digits
-            prefix_max_digits[prefix] = num_digits
-        elif not newnum in noderanges[prefix]:
-            noderanges[prefix].append(newnum)
-            prefix_min_digits[prefix] = min(prefix_min_digits[prefix], num_digits)
-            prefix_max_digits[prefix] = max(prefix_max_digits[prefix], num_digits)
+        try:
+            prefix = reg.match(name).group(1)
+            nodenum = reg.match(name).group(2)
+            num_digits = len(nodenum)
+            newnum = int(nodenum)
+            if not prefix in noderanges:
+                noderanges[prefix] = [newnum]
+                prefix_min_digits[prefix] = num_digits
+                prefix_max_digits[prefix] = num_digits
+            elif not newnum in noderanges[prefix]:
+                noderanges[prefix].append(newnum)
+                prefix_min_digits[prefix] = min(prefix_min_digits[prefix], num_digits)
+                prefix_max_digits[prefix] = max(prefix_max_digits[prefix], num_digits)
+        except AttributeError:
+            ret.append(name)
+            # we don't have a number on this node.  It's a one-off.
 
     #set format string.  Compensate for constant-length naming conventions.
     #Thanks Andrew!
     for prefix in prefix_min_digits.keys():
         if prefix_min_digits[prefix] == prefix_max_digits[prefix]:
             prefix_format_str[prefix] = {
-                    'compact': ("[%%s%%%d.%dd-%%%d.%dd]" %
+                    'compact': ("%%s[%%%d.%dd-%%%d.%dd]" %
                         (prefix_min_digits[prefix], prefix_min_digits[prefix],
                         prefix_min_digits[prefix], prefix_min_digits[prefix])),
                     'single': ("%%s%%%d.%dd" % (prefix_min_digits[prefix],
@@ -316,7 +323,6 @@ def merge_nodelist(locations):
                                          'single': "%s%s"}
 
     # iterate through the sorted lists, identifying gaps in the sequential numbers
-    ret = []
     for prefix in sorted(noderanges.keys()):
         noderanges[prefix].sort()
         breaks = []
@@ -339,7 +345,7 @@ def merge_nodelist(locations):
                 ret.append(prefix_format_str[prefix]['single'] %
                         (prefix, noderanges[prefix][brk[0]]))
 
-    return ','.join(ret)
+    return ','.join(sorted(ret))
 
 def dgetopt_long(arglist, opt, vopt, msg):
     '''parse options into a dictionary, long and short options supported'''
@@ -1026,44 +1032,40 @@ class disk_writer_thread(Thread):
                     #on open, even though I believe the linux kernel gets this wrong.
                     fd = os.open(file_msg.filename, os.O_WRONLY|os.O_APPEND|os.O_NONBLOCK)
                 except IOError as (num, strerror):
-                    
                     errcode = errno.errorcode[num]
-
                     if num == errno.EACCES:
-                        logger.error("Unable to write to %s with error code: "
-                                "%s. Permission Denied.", errcode,
-                                    file_msg.filename)
+                        logger.error("Unable to write to %s with error code: %s. Permission Denied.", file_msg.filename, errcode)
                         messages_to_remove.append(file_msg)
                     elif num == errno.EDQUOT: 
-                        logger.error("Unable to write to %s. Quota Exceeded.", file_msg.filename)
+                        logger.error("Unable to write to %s with error code: %s. Quota Exceeded.", file_msg.filename, errcode)
                         messages_to_remove.append(file_msg)
                     elif num in [errno.EFAULT,errno.EINVAL,errno.EIO]:
-                        logger.error("Unable to write to %s. Fatal Error.", file_msg.filename)
+                        logger.error("Unable to write to %s with error code: %s. Fatal Error.", file_msg.filename, errcode)
                         messages_to_remove.append(file_msg) 
                     elif num == errno.ENXIO:
                         logger.error("Why are you trying to open a pipe?")
                         messages_to_remove.append(file_msg) 
                     else:
-                        logger.debug("Failed to write to %s.  Holding message for retry.",
-                                file_msg.filename)
+                        logger.debug("Failed to write to %s with error code: %s.  Holding message for retry.",
+                                file_msg.filename, errcode)
                         continue
                 except OSError as (num, strerror):
-
+                    errcode = errno.errorcode[num]
                     if num == errno.EACCES:
-                        logger.error("Unable to write to %s. Permission Denied.",file_msg.filename)
+                        logger.error("OSError: Unable to write to %s with error code: %s. Permission Denied.",file_msg.filename, errcode)
                         messages_to_remove.append(file_msg)
                     elif num == errno.EDQUOT: 
-                        logger.error("Unable to write to %s. Quota Exceeded.", file_msg.filename)
+                        logger.error("OSError: Unable to write to %s with error code: %s. Quota Exceeded.", file_msg.filename, errcode)
                         messages_to_remove.append(file_msg)
                     elif num in [errno.EFAULT,errno.EINVAL,errno.EIO]:
-                        logger.error("Unable to write to %s. Fatal Error.", file_msg.filename)
+                        logger.error("OSError: Unable to write to %s with error code: %s. Fatal Error.", file_msg.filename, errcode)
                         messages_to_remove.append(file_msg) 
                     elif num == errno.ENXIO:
-                        logger.error("Why are you trying to open a pipe?")
+                        logger.error("OSError: Why are you trying to open a pipe?")
                         messages_to_remove.append(file_msg) 
                     else:
-                        logger.debug("Failed to write to %s.  Holding message for retry.", 
-                                file_msg.filename)
+                        logger.debug("OSError: Failed to write to %s with error code: %s.  Holding message for retry.", 
+                                file_msg.filename, errcode)
                         continue
                 except Exception:
                     logger.critical("Unknown error recieved when writing to cobaltlog %s. "\

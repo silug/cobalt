@@ -1,5 +1,4 @@
 """Resource management for Cray ALPS based systems"""
-
 import logging
 import thread
 import time
@@ -16,14 +15,12 @@ from Cobalt.Util import compact_num_list
 from Cobalt.Util import init_cobalt_config, get_config_option
 
 _logger = logging.getLogger(__name__)
-
 init_cobalt_config()
 
-UPDATE_THREAD_TIMEOUT = int(get_config_option('alpssystem',
-    'update_thread_timeout', 10))
+UPDATE_THREAD_TIMEOUT = int(get_config_option('alpssystem', 'update_thread_timeout', 10))
 SAVE_ME_INTERVAL = float(get_config_option('alpsssytem', 'save_me_interval', 10.0))
-PENDING_STARTUP_TIMEOUT = float(get_config_option('alpssystem',
-    'pending_startup_timeout', 1200)) #default 20 minutes to account for boot.
+#default 20 minutes to account for boot.
+PENDING_STARTUP_TIMEOUT = float(get_config_option('alpssystem', 'pending_startup_timeout', 1200))
 APKILL_CMD = get_config_option('alps', 'apkill', '/opt/cray/alps/default/bin/apkill')
 
 
@@ -128,6 +125,12 @@ class CraySystem(CrayBaseSystem):
                 #reservations = ALPSBridge.fetch_reservations()
                 #_logger.info('ALPS RESERVATION DATA FETCHED')
                 # reserved_nodes = ALPSBridge.reserved_nodes()
+                ssd_enabled = ALPSBridge.fetch_ssd_enable()
+                _logger.info('CAPMC SSD ENABLED DATA FETCHED')
+                ssd_info = ALPSBridge.fetch_ssd_static_data()
+                _logger.info('CAPMC SSD DETAIL DATA FETCHED')
+                ssd_diags = ALPSBridge.fetch_ssd_diags()
+                _logger.info('CAPMC SSD DIAG DATA FETCHED')
             except Exception:
                 #don't crash out here.  That may trash a statefile.
                 _logger.error('Possible transient encountered during initialization. Retrying.',
@@ -136,7 +139,7 @@ class CraySystem(CrayBaseSystem):
             else:
                 pending = False
 
-        self._assemble_nodes(inventory, system)
+        self._assemble_nodes(inventory, system, ssd_enabled, ssd_info, ssd_diags)
         #Reversing the node name to id lookup is going to save a lot of cycles.
         for node in self.nodes.values():
             self.node_name_to_id[node.name] = node.node_id
@@ -145,9 +148,22 @@ class CraySystem(CrayBaseSystem):
         # self._assemble_reservations(reservations, reserved_nodes)
         return
 
-    def _assemble_nodes(self, inventory, system):
+    def _assemble_nodes(self, inventory, system, ssd_enabled, ssd_info, ssd_diags):
         '''merge together the INVENTORY and SYSTEM query data to form as
         complete a picture of a node as we can.
+
+        Args:
+            inventory - ALPS QUERY(INVENTORY) data
+            system - ALPS QUERY(SYSTEM) data
+            ssd_enable - CAPMC get_ssd_enable data
+            ssd_info - CAPMC get_ssds data
+            ssd_diags - CAPMC get_ssd_diags data
+
+        Returns:
+            None
+
+        Side Effects:
+            Populates the node dictionary
 
         '''
         nodes = {}
@@ -162,20 +178,66 @@ class CraySystem(CrayBaseSystem):
             if nodes[node_id].role.upper() not in ['BATCH']:
                 nodes[node_id].status = 'down'
             nodes[node_id].status = nodespec['state']
-        self.nodes.update(nodes)
+        self._update_ssd_data(nodes, ssd_enabled, ssd_info, ssd_diags)
+        self.nodes = nodes
+
+    def _update_ssd_data(self, nodes, ssd_enabled=None, ssd_info=None, ssd_diags=None):
+        '''Update/add ssd data from CAPMC'''
+        if ssd_enabled is not None:
+            for ssd_data in ssd_enabled['nids']:
+                try:
+                    nodes[str(ssd_data['nid'])].attributes['ssd_enabled'] = int(ssd_data['ssd_enable'])
+                except KeyError:
+                    _logger.warning('ssd info present for nid %s, but not reported in ALPS.', ssd_data['nid'])
+        if ssd_info is not None:
+            for ssd_data in ssd_info['nids']:
+                try:
+                    nodes[str(ssd_data['nid'])].attributes['ssd_info'] = ssd_data
+                except KeyError:
+                    _logger.warning('ssd info present for nid %s, but not reported in ALPS.', ssd_data['nid'])
+        if ssd_diags is not None:
+            for diag_info in ssd_diags['ssd_diags']:
+                try:
+                    node = nodes[str(diag_info['nid'])]
+                except KeyError:
+                    _logger.warning('ssd diag data present for nid %s, but not reported in ALPS.', ssd_data['nid'])
+                else:
+                    for field in ['life_remaining', 'ts', 'firmware', 'percent_used']:
+                        node.attributes['ssd_info'][field] = diag_info[field]
+
+
+    def _assemble_reservations(self, reservations, reserved_nodes):
+        # FIXME: we can recover reservations now.  Implement this.
+        pass
+
+    def _gen_node_to_queue(self):
+        '''(Re)Generate a mapping for fast lookup of node-id's to queues.'''
+        with self._node_lock:
+            self.nodes_by_queue = {}
+            for node in self.nodes.values():
+                for queue in node.queues:
+                    if queue in self.nodes_by_queue.keys():
+                        self.nodes_by_queue[queue].add(node.node_id)
+                    else:
+                        self.nodes_by_queue[queue] = set([node.node_id])
 
     def _run_update_state(self):
         '''automated node update functions on the update timer go here.'''
-        while True:
+
+        def _run_and_wrap(func):
             try:
-                self.process_manager.update_launchers()
-                self.update_node_state()
-                self._get_exit_status()
+                func()
             except Exception:
-                # prevent the update thread from dying
+                # Prevent this thread from dying.
                 _logger.critical('Error in _run_update_state', exc_info=True)
-            finally:
-                Cobalt.Util.sleep(UPDATE_THREAD_TIMEOUT)
+
+        while True:
+            # Each of these is wrapped in it's own log-and-preserve block.
+            # The outer try is there to ensure the thread update timeout happens.
+            _run_and_wrap(self.process_manager.update_launchers)
+            _run_and_wrap(self.update_node_state)
+            _run_and_wrap(self._get_exit_status)
+            Cobalt.Util.sleep(UPDATE_THREAD_TIMEOUT)
 
     def _reconstruct_node(self, inven_node, inventory):
         '''Reconstruct a node from statefile information.  Needed whenever we
@@ -216,6 +278,7 @@ class CraySystem(CrayBaseSystem):
         self.nodes[str(nid)] = new_node
         self.logger.warning('Node %s added to tracking.', nid)
 
+
     @exposed
     def update_node_state(self):
         '''update the state of cray nodes. Check reservation status and system
@@ -245,6 +308,9 @@ class CraySystem(CrayBaseSystem):
                 inven_nodes = ALPSBridge.extract_system_node_data(ALPSBridge.system())
                 reservations = ALPSBridge.fetch_reservations()
                 #reserved_nodes = ALPSBridge.reserved_nodes()
+                # Fetch SSD diagnostic data and enabled flags. I would hope these change in event of dead ssd
+                ssd_enabled = ALPSBridge.fetch_ssd_enable()
+                ssd_diags = ALPSBridge.fetch_ssd_diags()
             except (ALPSBridge.ALPSError, ComponentLookupError):
                 _logger.warning('Error contacting ALPS for state update.  Aborting this update',
                         exc_info=True)
@@ -277,11 +343,17 @@ class CraySystem(CrayBaseSystem):
                             #pending hardware status update
                             self.nodes[str(node_id)].status = 'idle'
                     res_jobid_to_delete.append(alps_res.jobid)
-                    _logger.info('Nodes %s cleanup complete.',
-                            compact_num_list(alps_res.node_ids))
+                    _logger.info('job %s: Nodes %s cleanup complete.', alps_res.jobid, compact_num_list(alps_res.node_ids))
             for jobid in res_jobid_to_delete:
                 _logger.info('%s: ALPS reservation for this job complete.', jobid)
-                del self.alps_reservations[str(jobid)]
+                try:
+                    del self.alps_reservations[str(jobid)]
+                except KeyError:
+                    _logger.warning('Job %s: Attempted to remove ALPS reservation for this job multiple times', jobid)
+                if self.alps_reservations.get(int(jobid), None) is not None:
+                    # in case of type leakage
+                    _logger.warning('Job %s: ALPS reservation found with integer key: deleting', jobid)
+                    del self.alps_reservations[jobid]
             #process group should already be on the way down since cqm released the
             #resource reservation
             cleanup_nodes = [node for node in self.nodes.values()
@@ -320,6 +392,7 @@ class CraySystem(CrayBaseSystem):
                 if self.nodes.has_key(str(inven_node['node_id'])):
                     node = self.nodes[str(inven_node['node_id'])]
                     node.role = inven_node['role'].upper()
+                    node.attributes.update(inven_node['attrs'])
                     if node.reserved:
                         #node marked as reserved.
                         if self.alps_reservations.has_key(str(node.reserved_jobid)):
@@ -349,6 +422,8 @@ class CraySystem(CrayBaseSystem):
                         self._reconstruct_node(inven_node, recon_inventory)
                    # _logger.error('UNS: ALPS reports node %s but not in our node list.',
                    #               inven_node['node_id'])
+            # Update SSD data:
+            self._update_ssd_data(self.nodes, ssd_enabled=ssd_enabled, ssd_diags=ssd_diags)
             #should down win over running in terms of display?
             #keep node that are marked for cleanup still in cleanup
             for node in cleanup_nodes:
@@ -507,7 +582,10 @@ class CraySystem(CrayBaseSystem):
         new_alps_res = None
         if res_info is not None:
             new_alps_res = ALPSReservation(job, res_info, self.nodes)
-            self.alps_reservations[job['jobid']] = new_alps_res
+            self.alps_reservations[str(job['jobid'])] = new_alps_res
+        else:
+            _logger.warning('Job %s: Attempted reservation but allocator returned no nodes.', job['jobid'])
+            return None
         return new_alps_res.node_ids
 
 
@@ -561,8 +639,8 @@ class CraySystem(CrayBaseSystem):
                         'nodes': nodecount,
                         'attrs': {},
                         }
-            self._ALPS_reserve_resources(job_info, new_time, node_list)
-            alps_res = self.alps_reservations.get(current_pg.jobid, None)
+            self._ALPS_reserve_resources(job_info, new_time, expand_num_list(node_list))
+            alps_res = self.alps_reservations.get(str(pg.jobid), None)
             if alps_res is None:
                 _logger.warning('%s: Unable to re-reserve ALPS resources.',
                         current_pg.label)
@@ -574,6 +652,3 @@ class CraySystem(CrayBaseSystem):
                 specs['user'], pg_id)
         ALPSBridge.confirm(int(alps_res.alps_res_id), pg_id)
         return True
-
-
-

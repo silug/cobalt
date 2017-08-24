@@ -33,10 +33,8 @@ _logger = logging.getLogger(__name__)
 
 init_cobalt_config()
 
-UPDATE_THREAD_TIMEOUT = int(get_config_option('alpssystem',
-    'update_thread_timeout', 10))
-TEMP_RESERVATION_TIME = int(get_config_option('alpssystem',
-    'temp_reservation_time', 300))
+UPDATE_THREAD_TIMEOUT = int(get_config_option('alpssystem', 'update_thread_timeout', 10))
+TEMP_RESERVATION_TIME = int(get_config_option('alpssystem', 'temp_reservation_time', 300))
 SAVE_ME_INTERVAL = float(get_config_option('alpsssytem', 'save_me_interval', 10.0))
 PENDING_STARTUP_TIMEOUT = float(get_config_option('alpssystem',
     'pending_startup_timeout', 1200)) #default 20 minutes to account for boot.
@@ -44,13 +42,20 @@ DRAIN_MODES = ['first-fit', 'backfill']
 DRAIN_MODE = get_config_option('system', 'drain_mode', 'first-fit')
 #cleanup time in seconds
 CLEANUP_DRAIN_WINDOW = get_config_option('system', 'cleanup_drain_window', 300)
-
+#SSD information
+DEFAULT_MIN_SSD_SIZE = int(get_config_option('alpssystem', 'min_ssd_size', -1))
 #Epsilon for backfilling.  This system does not do this on a per-node basis.
 BACKFILL_EPSILON = int(get_config_option('system', 'backfill_epsilon', 120))
 ELOGIN_HOSTS = [host for host in get_config_option('system', 'elogin_hosts', '').split(':')]
 if ELOGIN_HOSTS == ['']:
     ELOGIN_HOSTS = []
-
+DRAIN_MODES = ['first-fit', 'backfill']
+CLEANING_ID = -1
+DEFAULT_MCDRAM_MODE = get_config_option('alpssystem', 'default_mcdram_mode', 'cache')
+DEFAULT_NUMA_MODE = get_config_option('alpssystem', 'default_numa_mode', 'quad')
+MCDRAM_TO_HBMCACHEPCT = {'flat':'0', 'cache':'100', 'split':'25', 'equal':'50', '0':'0', '25':'25', '50':'50', '100':'100'}
+VALID_MCDRAM_MODES = ['flat', 'cache', 'split', 'equal', '0', '25', '50', '100']
+VALID_NUMA_MODES = ['a2a', 'hemi', 'quad', 'snc2', 'snc4']
 
 def chain_loc_list(loc_list):
     '''Take a list of compact Cray locations,
@@ -318,12 +323,19 @@ class CrayBaseSystem(BaseSystem):
             self.current_equivalence_classes.append(eq_class)
         return equiv
 
-    @staticmethod
-    def _setup_special_locaitons(job):
+    def _setup_special_locations(self, job):
         forbidden = set([str(loc) for loc in chain_loc_list(job.get('forbidden', []))])
         required = set([str(loc) for loc in chain_loc_list(job.get('required', []))])
         requested_locations = set([str(n) for n in expand_num_list(job['attrs'].get('location', ''))])
-        return (forbidden, required, requested_locations)
+        # If ssds are required, add nodes without working SSDs to the forbidden list
+        ssd_unavail = set([])
+        if job.get('attrs', {}).get("ssds", "none").lower() == "required":
+            ssd_min_size = int(job.get('attrs', {}).get("ssd_size", DEFAULT_MIN_SSD_SIZE)) * 1000000000 #convert to bytes
+            ssd_unavail.update(set([str(node.node_id) for node in self.nodes.values()
+                                  if (node.attributes['ssd_enabled'] == 0 or
+                                      int(node.attributes.get('ssd_info', {'size': DEFAULT_MIN_SSD_SIZE})['size'])  < ssd_min_size)
+                                ]))
+        return (forbidden, required, requested_locations, ssd_unavail)
 
     def _assemble_queue_data(self, job, idle_only=True, drain_time=None):
         '''put together data for a queue, or queue-like reservation structure.
@@ -343,7 +355,7 @@ class CrayBaseSystem(BaseSystem):
         # have to intersect required nodes with the idle and available
         # we also have to forbid a bunch of locations, in  this case.
         unavailable_nodes = []
-        forbidden, required, requested_locations = self._setup_special_locaitons(job)
+        forbidden, required, requested_locations, ssd_unavail = self._setup_special_locations(job)
         requested_loc_in_forbidden = False
         for loc in requested_locations:
             if loc in forbidden:
@@ -353,16 +365,16 @@ class CrayBaseSystem(BaseSystem):
         if job['queue'] not in self.nodes_by_queue.keys():
             # Either a new queue with no resources, or a possible
             # reservation need to do extra work for a reservation
-            node_id_list = list(required - forbidden)
+            node_id_list = list(required - forbidden - ssd_unavail)
         else:
-            node_id_list = list(set(self.nodes_by_queue[job['queue']]) - forbidden)
+            node_id_list = list(set(self.nodes_by_queue[job['queue']]) - forbidden - ssd_unavail)
         if requested_locations != set([]): # handle attrs location= requests
             job_set = set([str(nid) for nid in requested_locations])
             if job['queue'] not in self.nodes_by_queue.keys():
                 #we're in a reservation and need to further restrict nodes.
                 if job_set <= set(node_id_list):
                     # We are in a reservation there are no forbidden nodes.
-                    node_id_list = list(requested_locations)
+                    node_id_list = list(requested_locations - ssd_unavail)
                 else:
                     # We can't run this job.  Insufficent resources in this
                     # reservation to do so.  Don't risk blocking anything.
@@ -376,9 +388,7 @@ class CrayBaseSystem(BaseSystem):
                         # this job has requested locations that are a part of an
                         # active reservation.  Remove locaitons and drop available
                         # nodecount appropriately.
-                        node_id_list = list(set(node_id_list) - forbidden)
-                else:
-                    node_id_list = []
+                        node_id_list = list(set(node_id_list) - forbidden - ssd_unavail)
                     if not requested_loc_in_forbidden:
                         raise ValueError("forbidden locations not in queue")
         with self._node_lock:
@@ -418,6 +428,42 @@ class CrayBaseSystem(BaseSystem):
                 node_id_list.sort(key=lambda nid: int(nid))
                 ret_nodes = node_id_list[:int(job['nodes'])]
         return ret_nodes
+
+    def _select_first_nodes_prefer_memory_match(self, job, node_id_list):
+        '''Given a list of nids, select the first node count nodes fromt the
+        list.  Prefer nodes that match the memory modes for a given job, then
+        go in nid order.
+
+        Input:
+            job - dictionary of job data from the scheduler
+            node_id_list - a list of possible candidate nodes
+
+        Return:
+            A list of nodes.  [] if insufficient nodes for the allocation.
+
+        Note: hold the node lock while doing this.  We really don't want a
+        update to happen while doing this.
+
+        '''
+        ssd_required = (job.get('attrs', {}).get("ssds", "none").lower() == "required")
+        if job.get('attrs', {}).get('mcdram', None) is None or job.get('attrs', {}).get('numa', None) is None:
+            # insufficient information to include a mode match
+            return self._select_first_nodes(job, node_id_list)
+        ret_nids = []
+        with self._node_lock:
+            considered_nodes = [node for node in self.nodes.values() if node.node_id in node_id_list]
+            for node in considered_nodes:
+                if (node.attributes['hbm_cache_pct'] == MCDRAM_TO_HBMCACHEPCT[job['attrs']['mcdram']] and
+                        node.attributes['numa_cfg'] == job['attrs']['numa']):
+                    ret_nids.append(int(node.node_id))
+            if len(ret_nids) < int(job['nodes']):
+                node_id_list.sort(key=lambda nid: int(nid))
+                for nid in node_id_list:
+                    if int(nid) not in ret_nids:
+                        ret_nids.append(int(nid))
+                        if len(ret_nids) >= int(job['nodes']):
+                            break
+        return ret_nids[:int(job['nodes'])]
 
     def _associate_and_run_immediate(self, job, resource_until_time, node_id_list):
         '''Given a list of idle node ids, choose a set that can run a job
@@ -594,7 +640,7 @@ class CrayBaseSystem(BaseSystem):
         drain_list = []
         candidate_list = []
         cleanup_statuses = ['cleanup', 'cleanup-pending']
-        forbidden, required, requested_locations = self._setup_special_locaitons(job)
+        forbidden, required, requested_locations, ssd_unavail = self._setup_special_locations(job)
         try:
             node_id_list = self._assemble_queue_data(job, idle_only=False)
         except ValueError:
@@ -607,8 +653,9 @@ class CrayBaseSystem(BaseSystem):
                 # 1. idle nodes that are already marked for draining.
                 # 2. Nodes that are in an in-use status (busy, allocated).
                 # 3. Nodes marked for cleanup that are not allocated to a real
-                #    jobid. Not sure if this last bit is the right thing to do
-                #    --PMR
+                #    jobid. CLEANING_ID is a sentiel jobid value so we can set
+                #    a drain window on cleaning nodes easiliy.  Not sure if this
+                #    is the right thing to do. --PMR
                 candidate_list = []
                 candidate_list = [nid for nid in node_id_list
                         if (not self.nodes[str(nid)].draining and
@@ -642,6 +689,8 @@ class CrayBaseSystem(BaseSystem):
                 # location and reservation avoidance data:
                 if forbidden != set([]):
                     candidates = candidates.difference(forbidden)
+                if ssd_unavail != set([]):
+                    candidates = candidates.difference(ssd_unavail)
                 if requested_locations != set([]):
                     candidates = candidates.intersection(requested_locations)
                 candidate_list = list(candidates)
@@ -737,75 +786,6 @@ class CrayBaseSystem(BaseSystem):
                     completed = True
         return completed
 
-    @exposed
-    def add_process_groups(self, specs):
-        '''Add process groups and start their runs.  Adjust the resource
-        reservation time to full run time at this point.
-
-        Args:
-            specs: A list of dictionaries that contain information on the Cobalt
-                   job required to start the backend process.
-
-        Returns:
-            A created process group object.  This is wrapped and sent via XMLRPC
-            to the caller.
-
-        Side Effects:
-            Invokes a forker component to run a user script.  In the event of a
-            fatal startup error, will release resource reservations.
-
-        '''
-        start_apg_timer = int(time.time())
-
-        for spec in specs:
-            spec['forker'] = None
-            alps_res = self.alps_reservations.get(str(spec['jobid']), None)
-            if alps_res is not None:
-                spec['alps_res_id'] = alps_res.alps_res_id
-            new_pgroups = self.process_manager.init_groups(specs)
-        for pgroup in new_pgroups:
-            _logger.info('%s: process group %s created to track job status',
-                    pgroup.label, pgroup.id)
-            #check resource reservation, and attempt to start.  If there's a
-            #failure here, set exit status in process group to a sentinel value.
-            try:
-                started = self.process_manager.start_groups([pgroup.id])
-            except ComponentLookupError:
-                _logger.error("%s: failed to contact the %s component",
-                        pgroup.label, pgroup.forker)
-                #this should be reraised and the queue-manager handle it
-                #that would allow re-requesting the run instead of killing the
-                #job --PMR
-            except xmlrpclib.Fault:
-                _logger.error("%s: a fault occurred while attempting to start "
-                        "the process group using the %s component",
-                        pgroup.label, pgroup.forker)
-                pgroup.exit_status = 255
-                self.reserve_resources_until(pgroup.location, None,
-                        pgroup.jobid)
-            except Exception:
-                _logger.error("%s: an unexpected exception occurred while "
-                        "attempting to start the process group using the %s "
-                        "component; releasing resources", pgroup.label,
-                        pgroup.forker, exc_info=True)
-                pgroup.exit_status = 255
-                self.reserve_resources_until(pgroup.location, None,
-                        pgroup.jobid)
-            else:
-                if started is not None and started != []:
-                    _logger.info('%s: Process Group %s started successfully.',
-                            pgroup.label, pgroup.id)
-                else:
-                    _logger.error('%s: Process Group startup failed. Aborting.',
-                            pgroup.label)
-                    pgroup.exit_status = 255
-                    self.reserve_resources_until(pgroup.location, None,
-                            pgroup.jobid)
-
-        end_apg_timer = int(time.time())
-        self.logger.debug("add_process_groups startup time: %s sec",
-                (end_apg_timer - start_apg_timer))
-        return new_pgroups
 
     @exposed
     def wait_process_groups(self, specs):
@@ -832,6 +812,78 @@ class CrayBaseSystem(BaseSystem):
         return self.process_manager.process_groups.q_get(specs)
 
     @exposed
+    def add_process_groups(self, specs):
+        '''Add process groups and start their runs.  Adjust the resource
+        reservation time to full run time at this point.
+
+        Args:
+            specs: A list of dictionaries that contain information on the Cobalt
+                   job required to start the backend process.
+
+        Returns:
+            A created process group object.  This is wrapped and sent via XMLRPC
+            to the caller.
+
+        Side Effects:
+            Invokes a forker component to run a user script.  In the event of a
+            fatal startup error, will release resource reservations.
+
+        Note:
+            Process Group startup and intialization holds the process group data lock.
+
+        '''
+        start_apg_timer = time.time()
+        with self.process_manager.process_groups_lock:
+            for spec in specs:
+                spec['forker'] = None
+                alps_res = self.alps_reservations.get(str(spec['jobid']), None)
+                if alps_res is not None:
+                    spec['alps_res_id'] = alps_res.alps_res_id
+                new_pgroups = self.process_manager.init_groups(specs)
+            for pgroup in new_pgroups:
+                _logger.info('%s: process group %s created to track job status',
+                        pgroup.label, pgroup.id)
+                #check resource reservation, and attempt to start.  If there's a
+                #failure here, set exit status in process group to a sentinel value.
+                try:
+                    started = self.process_manager.start_groups([pgroup.id])
+                except ComponentLookupError:
+                    _logger.error("%s: failed to contact the %s component",
+                            pgroup.label, pgroup.forker)
+                    #this should be reraised and the queue-manager handle it
+                    #that would allow re-requesting the run instead of killing the
+                    #job --PMR
+                except xmlrpclib.Fault:
+                    _logger.error("%s: a fault occurred while attempting to start "
+                            "the process group using the %s component",
+                            pgroup.label, pgroup.forker)
+                    pgroup.exit_status = 255
+                    self.reserve_resources_until(pgroup.location, None,
+                            pgroup.jobid)
+                except Exception:
+                    _logger.error("%s: an unexpected exception occurred while "
+                            "attempting to start the process group using the %s "
+                            "component; releasing resources", pgroup.label,
+                            pgroup.forker, exc_info=True)
+                    pgroup.exit_status = 255
+                    self.reserve_resources_until(pgroup.location, None,
+                            pgroup.jobid)
+                else:
+                    if started is not None and started != []:
+                        _logger.info('%s: Process Group %s started successfully.',
+                                pgroup.label, pgroup.id)
+                    else:
+                        _logger.error('%s: Process Group startup failed. Aborting.',
+                                pgroup.label)
+                        pgroup.exit_status = 255
+                        self.reserve_resources_until(pgroup.location, None,
+                                pgroup.jobid)
+        end_apg_timer = time.time()
+        self.logger.debug("add_process_groups startup time: %s sec", (end_apg_timer - start_apg_timer))
+        return new_pgroups
+
+
+    @exposed
     @query
     def signal_process_groups(self, specs, signame="SIGINT"):
         '''Send a signal to underlying child process.  Defalut signal is SIGINT.
@@ -849,11 +901,12 @@ class CrayBaseSystem(BaseSystem):
         is called.
 
         '''
-        completed_pgs = self.process_manager.update_groups()
-        for pgroup in completed_pgs:
-            _logger.info('%s: process group reported as completed with status %s',
-                    pgroup.label, pgroup.exit_status)
-            self.reserve_resources_until(pgroup.location, None, pgroup.jobid)
+        with self.process_manager.process_groups_lock:
+            completed_pgs = self.process_manager.update_groups()
+            for pgroup in completed_pgs:
+                _logger.info('%s: process group reported as completed with status %s',
+                        pgroup.label, pgroup.exit_status)
+                self.reserve_resources_until(pgroup.location, None, pgroup.jobid)
         return
 
     @exposed
@@ -863,8 +916,21 @@ class CrayBaseSystem(BaseSystem):
         JobValidationError.
 
         '''
-        #Right now this does nothing.  Still figuring out what a valid
-        #specification looks like.
+        #set default memory modes.
+        if spec.get('attrs', None) is None:
+            spec['attrs'] = {'mcdram': DEFAULT_MCDRAM_MODE, 'numa': DEFAULT_NUMA_MODE}
+        else:
+            if spec['attrs'].get('mcdram', None) is None:
+                spec['attrs']['mcdram'] = DEFAULT_MCDRAM_MODE
+            if spec['attrs'].get('numa', None) is None:
+                spec['attrs']['numa'] = DEFAULT_NUMA_MODE
+        # It helps when the mode requested actually exists.
+        if spec['attrs']['mcdram'] not in VALID_MCDRAM_MODES:
+            raise JobValidationError('mcdram %s not valid must be one of: %s'% (spec['attrs']['mcdram'],
+                    ', '.join(VALID_MCDRAM_MODES)))
+        if spec['attrs']['numa'] not in VALID_NUMA_MODES:
+            raise JobValidationError('numa %s not valid must be one of: %s' % (spec['attrs']['numa'],
+                    ', '.join(VALID_NUMA_MODES)))
         # mode on this system defaults to script.
         mode = spec.get('mode', None)
         if ((mode is None) or (mode == False)):

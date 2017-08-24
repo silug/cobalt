@@ -538,6 +538,9 @@ on each node for XC40 systems. The default value is 72.
 
 .SS [alpssystem]
 .TP
+.B min_ssd_size
+The size of the smallest SSD available on the system in GB.
+.TP
 .B pgroup_startup_timeout
 The time to allow for process group startup in seconds. The default is 120
 seconds.
@@ -554,7 +557,11 @@ seconds.  The default is 300 seconds.
 .B update_thread_timeout
 The polling interval for state updates from ALPS in seconds.  The default is
 10 seconds.
-
+.SS [capmc]
+.TP
+.B path
+Path to CAPMC command front-end. If unset, the default is /opt/cray/capmc/default/bin/capmc
+.TP
 .SS [system]
 .TP
 .B backfill_epsillon
